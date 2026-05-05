@@ -10,6 +10,14 @@ import pandas as pd
 import qrcode
 import streamlit as st
 from PIL import Image
+
+try:
+    import cv2
+    import numpy as np
+except Exception:  # pragma: no cover
+    cv2 = None
+    np = None
+
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
@@ -25,8 +33,7 @@ LOCAL_DATA_DIR = "data"
 
 USERS = {
     "jc": {"password": "master", "role": "admin", "name": "JC"},
-    "Moira": {"password": "ventas", "role": "encargada", "name": "Moira"},
-    "Concha": {"password": "patrona", "role": "duena", "name": "Concha"},
+    "moira": {"password": "ventas", "role": "encargada", "name": "Moira"},
     "info": {"password": "precios", "role": "consulta", "name": "Consulta"},
 }
 
@@ -36,10 +43,6 @@ ROLES = {
         "fotos": True, "carga_masiva": True, "borrar": True, "reportes": True,
     },
     "encargada": {
-        "ver": True, "editar": True, "vender": True, "clientes": True,
-        "fotos": True, "carga_masiva": False, "borrar": False, "reportes": True,
-    },
-    "duena": {
         "ver": True, "editar": True, "vender": True, "clientes": True,
         "fotos": True, "carga_masiva": False, "borrar": False, "reportes": True,
     },
@@ -345,10 +348,11 @@ def login_screen() -> None:
         password = st.text_input("Clave", type="password")
         submit = st.form_submit_button("Entrar")
     if submit:
-        user = USERS.get(username)
+        username_key = username.strip().lower()
+        user = USERS.get(username_key)
         if user and user["password"] == password:
             st.session_state["logged_in"] = True
-            st.session_state["username"] = username
+            st.session_state["username"] = user.get("name", username_key)
             st.session_state["role"] = user["role"]
             st.rerun()
         else:
@@ -614,6 +618,164 @@ def fotos_tab(inventario: pd.DataFrame, fotos: pd.DataFrame) -> None:
                 show_photo(str(f["foto_data_url"]), str(f["fecha"]))
 
 
+def decode_qr_from_image(uploaded_file) -> str:
+    """Read QR text from a camera/uploaded image using OpenCV. Returns empty string if not found."""
+    if uploaded_file is None or cv2 is None or np is None:
+        return ""
+    try:
+        file_bytes = np.asarray(bytearray(uploaded_file.getvalue()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        if img is None:
+            return ""
+        detector = cv2.QRCodeDetector()
+        data, _points, _ = detector.detectAndDecode(img)
+        return str(data).strip() if data else ""
+    except Exception:
+        return ""
+
+
+def normalize_scanned_code(text: str) -> tuple[str, str]:
+    """Return (brand, code). Accepts MARCA|CODIGO, plain CODIGO, and URLs with ?pieza=."""
+    raw = str(text or "").strip()
+    if not raw:
+        return "", ""
+    if "pieza=" in raw:
+        part = raw.split("pieza=", 1)[1]
+        part = part.split("&", 1)[0].strip()
+        return "", part.upper()
+    if "|" in raw:
+        brand, code = raw.split("|", 1)
+        return brand.strip().upper(), code.strip().upper()
+    return "", raw.strip().upper()
+
+
+def pieza_card(row: pd.Series, show_internal: bool = False) -> None:
+    """Compact product card for QR/search results."""
+    c1, c2 = st.columns([1, 1.25])
+    with c1:
+        foto = str(row.get("foto_principal", ""))
+        if foto:
+            show_photo(foto, "Foto principal")
+        else:
+            st.caption("Sin foto cargada todavía.")
+        st.image(qr_image_bytes(str(row.get("qr_texto", ""))), caption=str(row.get("codigo_unico", "")), width=150)
+    with c2:
+        st.subheader(str(row.get("producto", "")))
+        st.write(f"**Marca:** {row.get('marca', '')}")
+        st.write(f"**Código pieza:** `{row.get('codigo_unico', '')}`")
+        talla = str(row.get("talla", "")).strip()
+        st.write(f"**Talla:** {talla if talla else '— pendiente —'}")
+        st.write(f"**Precio:** ${float(row.get('precio', 0) or 0):,.2f}")
+        st.write(f"**Estado:** {row.get('estado', '')}")
+        st.write(f"**Ubicación:** {row.get('ubicacion', '')}")
+        cliente = str(row.get("cliente_nombre", "")).strip()
+        if cliente and show_internal:
+            st.write(f"**Cliente:** {cliente}")
+        saldo = float(row.get("saldo", 0) or 0)
+        pagado = float(row.get("monto_pagado", 0) or 0)
+        if show_internal and (pagado or saldo):
+            st.write(f"**Pagado:** ${pagado:,.2f}")
+            st.write(f"**Saldo:** ${saldo:,.2f}")
+        notas = str(row.get("notas", "")).strip()
+        if notas and show_internal:
+            st.caption(f"Notas: {notas}")
+
+
+def consulta_qr_tab(inventario: pd.DataFrame) -> None:
+    st.header("Leer QR / consultar precio")
+    if inventario.empty:
+        st.warning("Todavía no hay inventario cargado.")
+        return
+
+    st.caption("Escanea o sube una foto del QR. También puedes escribir el código manualmente si la cámara no lo lee.")
+
+    scanned_text = ""
+    tab1, tab2 = st.tabs(["Cámara / foto", "Código manual"])
+    with tab1:
+        camera_file = st.camera_input("Tomar foto del QR")
+        uploaded_file = st.file_uploader("O subir imagen del QR", type=["jpg", "jpeg", "png"], key="qr_upload")
+        qr_source = camera_file or uploaded_file
+        if qr_source:
+            scanned_text = decode_qr_from_image(qr_source)
+            if scanned_text:
+                st.success(f"QR leído: {scanned_text}")
+            else:
+                st.warning("No pude leer el QR en esa imagen. Prueba acercarlo, mejorar la luz o escribir el código manualmente.")
+    with tab2:
+        manual = st.text_input("Código o texto del QR", placeholder="Ej: MARCA|ISH01-01 o ISH01-01")
+        if manual:
+            scanned_text = manual
+
+    brand, code = normalize_scanned_code(scanned_text)
+    if not code:
+        st.info("Cuando escanees o escribas un código, aquí aparecerá la pieza.")
+        return
+
+    df = inventario.copy()
+    mask = df["codigo_unico"].astype(str).str.upper().str.strip() == code
+    if brand:
+        mask = mask & (df["marca"].astype(str).str.upper().str.strip() == brand)
+    matches = df[mask]
+
+    if matches.empty:
+        # fallback: maybe QR is model code
+        model_mask = df["codigo_base"].astype(str).str.upper().str.strip() == code
+        if brand:
+            model_mask = model_mask & (df["marca"].astype(str).str.upper().str.strip() == brand)
+        model_matches = df[model_mask]
+        if not model_matches.empty:
+            st.subheader(f"Modelo {code}")
+            disponibles = int((model_matches["estado"].astype(str) == "disponible").sum())
+            precio = pd.to_numeric(model_matches["precio"], errors="coerce").dropna()
+            precio_txt = f"${float(precio.mode().iloc[0] if not precio.mode().empty else precio.iloc[0]):,.2f}" if not precio.empty else "—"
+            st.write(f"**Disponibles:** {disponibles}")
+            st.write(f"**Precio:** {precio_txt}")
+            st.dataframe(
+                model_matches[["marca", "codigo_unico", "producto", "talla", "precio", "estado", "ubicacion"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+            return
+        st.error(f"No encontré una pieza o modelo con el código `{code}`.")
+        return
+
+    row = matches.iloc[0]
+    pieza_card(row, show_internal=can("vender"))
+
+    if can("vender"):
+        st.divider()
+        st.subheader("Acción rápida")
+        idx = inventario.index[inventario["codigo_unico"].astype(str).str.upper().str.strip() == str(row["codigo_unico"]).upper().strip()][0]
+        with st.form("quick_qr_action"):
+            accion = st.selectbox("Acción", ["sin cambio", "reservar", "probando en casa", "vender", "volver a disponible"])
+            cliente_nombre = st.text_input("Cliente", value=str(row.get("cliente_nombre", "")))
+            monto_pagado = st.number_input("Monto pagado", min_value=0.0, step=10.0, value=float(row.get("monto_pagado", 0) or 0))
+            submit = st.form_submit_button("Guardar acción")
+        if submit and accion != "sin cambio":
+            precio = float(row.get("precio", 0) or 0)
+            saldo = max(precio - monto_pagado, 0)
+            if accion == "vender":
+                estado, ubicacion = "vendido", "fuera de tienda"
+            elif accion == "reservar":
+                estado, ubicacion = "reservado", "reservado en tienda"
+            elif accion == "probando en casa":
+                estado, ubicacion = "probando en casa", "casa cliente"
+            else:
+                estado, ubicacion = "disponible", "tienda"
+                cliente_nombre, monto_pagado, saldo = "", 0, precio
+            inventario.loc[idx, "estado"] = estado
+            inventario.loc[idx, "ubicacion"] = ubicacion
+            inventario.loc[idx, "cliente_nombre"] = cliente_nombre.strip()
+            inventario.loc[idx, "monto_pagado"] = monto_pagado
+            inventario.loc[idx, "saldo"] = saldo
+            inventario.loc[idx, "fecha_estado"] = now_str()
+            inventario.loc[idx, "fecha_actualizacion"] = now_str()
+            write_sheet("inventario", inventario)
+            append_movimiento(accion, codigo_unico=str(row["codigo_unico"]), detalle=f"QR - Cliente: {cliente_nombre}", monto=monto_pagado, precio=precio, saldo=saldo)
+            st.success("Acción guardada.")
+            st.rerun()
+
+
 def qr_tab(inventario: pd.DataFrame) -> None:
     st.header("QR para imprimir")
     if inventario.empty:
@@ -783,7 +945,7 @@ def main() -> None:
     sidebar_user()
     inventario, clientes, movimientos, fotos = load_all()
 
-    tabs = ["Resumen", "Inventario", "Clientes", "Ventas/Reservas", "Fotos", "QR", "Reportes"]
+    tabs = ["Resumen", "Leer QR", "Inventario", "Clientes", "Ventas/Reservas", "Fotos", "QR", "Reportes"]
     if can("carga_masiva"):
         tabs.insert(1, "Carga inicial")
 
@@ -791,6 +953,8 @@ def main() -> None:
 
     if selected == "Resumen":
         dashboard(inventario)
+    elif selected == "Leer QR":
+        consulta_qr_tab(inventario)
     elif selected == "Carga inicial":
         carga_inicial_tab()
     elif selected == "Inventario":
