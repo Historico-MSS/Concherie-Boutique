@@ -13,6 +13,7 @@ from PIL import Image
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 try:
     from streamlit_gsheets import GSheetsConnection
@@ -52,7 +53,7 @@ ESTADOS = ["disponible", "reservado", "probando en casa", "vendido", "mantenimie
 UBICACIONES = ["tienda", "casa cliente", "reservado en tienda", "fuera de tienda", "otro"]
 
 INVENTARIO_COLUMNS = [
-    "marca", "codigo_base", "codigo_unico", "qr_texto", "producto", "precio",
+    "marca", "codigo_base", "codigo_unico", "qr_texto", "producto", "talla", "precio",
     "estado", "ubicacion", "cliente_id", "cliente_nombre", "fecha_estado",
     "monto_pagado", "saldo", "notas", "foto_principal", "fecha_creacion", "fecha_actualizacion",
 ]
@@ -213,6 +214,7 @@ def excel_to_piece_inventory(uploaded_file) -> pd.DataFrame:
     col_codigo = next((c for c in raw.columns if c in ["codigo", "codigo_base", "codigo_concha", "code"]), None)
     col_producto = next((c for c in raw.columns if c in ["producto", "descripcion", "pieza", "item"]), None)
     col_cantidad = next((c for c in raw.columns if c in ["cantidad", "qty", "unidades"]), None)
+    col_talla = next((c for c in raw.columns if c in ["talla", "size"]), None)
     col_precio = next((c for c in raw.columns if c in ["precio_unitario", "precio", "price"]), None)
 
     if not col_codigo or not col_producto or not col_cantidad or not col_precio:
@@ -227,6 +229,9 @@ def excel_to_piece_inventory(uploaded_file) -> pd.DataFrame:
             continue
         producto = str(r.get(col_producto, "")).strip()
         marca = str(r.get(col_marca, "")).strip().upper() if col_marca else ""
+        talla = str(r.get(col_talla, "")).strip().upper() if col_talla else ""
+        if talla.lower() == "nan":
+            talla = ""
         try:
             cantidad = int(float(r.get(col_cantidad, 0)))
         except Exception:
@@ -243,6 +248,7 @@ def excel_to_piece_inventory(uploaded_file) -> pd.DataFrame:
                 "codigo_unico": codigo_unico,
                 "qr_texto": make_qr_text(marca, codigo_unico),
                 "producto": producto,
+                "talla": talla,
                 "precio": precio,
                 "estado": "disponible",
                 "ubicacion": "tienda",
@@ -374,7 +380,7 @@ def dashboard(inventario: pd.DataFrame) -> None:
         mask = df.astype(str).apply(lambda col: col.str.lower().str.contains(s, na=False)).any(axis=1)
         df = df[mask]
     st.dataframe(
-        df[["marca", "codigo_unico", "producto", "precio", "estado", "ubicacion", "cliente_nombre"]],
+        df[["marca", "codigo_unico", "producto", "talla", "precio", "estado", "ubicacion", "cliente_nombre"]],
         use_container_width=True,
         hide_index=True,
     )
@@ -417,6 +423,8 @@ def inventario_tab(inventario: pd.DataFrame, clientes: pd.DataFrame) -> None:
     with col1:
         st.write(f"**Marca:** {row['marca']}")
         st.write(f"**Producto:** {row['producto']}")
+        talla_actual = str(row.get("talla", "")).strip()
+        st.write(f"**Talla:** {talla_actual if talla_actual else '— pendiente —'}")
         st.write(f"**Precio:** ${float(row['precio']):,.2f}")
         st.write(f"**QR:** `{row['qr_texto']}`")
         st.image(qr_image_bytes(str(row["qr_texto"])), caption=str(row["codigo_unico"]), width=180)
@@ -434,6 +442,7 @@ def inventario_tab(inventario: pd.DataFrame, clientes: pd.DataFrame) -> None:
     with st.form("edit_piece"):
         marca = st.text_input("Marca", value=str(row["marca"]))
         producto = st.text_input("Producto", value=str(row["producto"]))
+        talla = st.text_input("Talla (opcional)", value=str(row.get("talla", "")))
         precio = st.number_input("Precio", min_value=0.0, step=10.0, value=float(row["precio"]))
         estado = st.selectbox("Estado", ESTADOS, index=ESTADOS.index(row["estado"]) if row["estado"] in ESTADOS else 0)
         ubicacion = st.selectbox("Ubicación", UBICACIONES, index=UBICACIONES.index(row["ubicacion"]) if row["ubicacion"] in UBICACIONES else 0)
@@ -445,6 +454,7 @@ def inventario_tab(inventario: pd.DataFrame, clientes: pd.DataFrame) -> None:
     if submitted:
         inventario.loc[idx, "marca"] = marca.strip().upper()
         inventario.loc[idx, "producto"] = producto.strip()
+        inventario.loc[idx, "talla"] = talla.strip().upper()
         inventario.loc[idx, "precio"] = precio
         inventario.loc[idx, "estado"] = estado
         inventario.loc[idx, "ubicacion"] = ubicacion
@@ -456,7 +466,7 @@ def inventario_tab(inventario: pd.DataFrame, clientes: pd.DataFrame) -> None:
         inventario.loc[idx, "fecha_estado"] = now_str()
         inventario.loc[idx, "fecha_actualizacion"] = now_str()
         write_sheet("inventario", inventario)
-        append_movimiento("edición pieza", codigo_unico=codigo, detalle=f"Estado: {estado}; ubicación: {ubicacion}", precio=precio, saldo=max(precio-monto_pagado, 0))
+        append_movimiento("edición pieza", codigo_unico=codigo, detalle=f"Estado: {estado}; ubicación: {ubicacion}; talla: {talla}", precio=precio, saldo=max(precio-monto_pagado, 0))
         st.success("Pieza actualizada.")
         st.rerun()
 
@@ -507,7 +517,9 @@ def ventas_tab(inventario: pd.DataFrame, clientes: pd.DataFrame) -> None:
     codigo = st.selectbox("Pieza", opciones["codigo_unico"].astype(str).tolist())
     idx = inventario.index[inventario["codigo_unico"].astype(str) == codigo][0]
     row = inventario.loc[idx]
-    st.write(f"**{row['producto']}** — {row['marca']} — ${float(row['precio']):,.2f}")
+    talla_txt = str(row.get("talla", "")).strip()
+    talla_part = f" — Talla {talla_txt}" if talla_txt else ""
+    st.write(f"**{row['producto']}** — {row['marca']}{talla_part} — ${float(row['precio']):,.2f}")
 
     cliente_names = [""] + clientes["nombre"].dropna().astype(str).tolist()
     with st.form("sale_form"):
@@ -621,6 +633,114 @@ def qr_tab(inventario: pd.DataFrame) -> None:
         )
 
 
+
+def data_url_to_image_reader(data_url: str):
+    try:
+        if isinstance(data_url, str) and data_url.startswith("data:image"):
+            encoded = data_url.split(",", 1)[1]
+            return ImageReader(io.BytesIO(base64.b64decode(encoded)))
+    except Exception:
+        return None
+    return None
+
+
+def create_catalogo_modelos_pdf(inventario: pd.DataFrame) -> bytes:
+    """Catálogo agrupado por modelo: foto, marca, código, producto, precio, disponibles, tallas y QR de modelo."""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+    margin = 1.1 * cm
+    card_w = (page_w - 2 * margin - 0.8 * cm) / 2
+    card_h = 8.0 * cm
+    gap_x = 0.8 * cm
+    gap_y = 0.7 * cm
+
+    df = inventario.copy()
+    if df.empty:
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(page_w/2, page_h/2, "Catálogo sin inventario")
+        c.save(); buffer.seek(0); return buffer.getvalue()
+
+    df["precio"] = pd.to_numeric(df["precio"], errors="coerce").fillna(0)
+    grouped = []
+    for (marca, codigo_base, producto), g in df.groupby(["marca", "codigo_base", "producto"], dropna=False):
+        disponibles = int((g["estado"].astype(str) == "disponible").sum())
+        if disponibles <= 0:
+            continue
+        fotos = g["foto_principal"].dropna().astype(str)
+        foto = next((x for x in fotos if x.startswith("data:image")), "")
+        precio = g["precio"].mode().iloc[0] if not g["precio"].mode().empty else g["precio"].iloc[0]
+        tallas = g[g["estado"].astype(str) == "disponible"]["talla"].fillna("").astype(str).str.strip()
+        tallas = tallas[tallas != ""]
+        if not tallas.empty:
+            tallas_texto = ", ".join([f"{t}: {n}" for t, n in tallas.value_counts().sort_index().items()])
+        else:
+            tallas_texto = "Tallas: pendiente"
+        grouped.append({
+            "marca": str(marca), "codigo_base": str(codigo_base), "producto": str(producto),
+            "precio": float(precio), "disponibles": disponibles, "foto": foto, "tallas": tallas_texto,
+            "qr_texto": make_qr_text(str(marca), str(codigo_base)),
+        })
+
+    grouped = sorted(grouped, key=lambda x: (x["marca"], x["codigo_base"]))
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(margin, page_h - margin, "Catálogo de Inventario")
+    c.setFont("Helvetica", 9)
+    c.drawRightString(page_w - margin, page_h - margin + 0.1*cm, datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+    start_y = page_h - margin - 1.0 * cm
+    for i, item in enumerate(grouped):
+        pos = i % 6
+        if i > 0 and pos == 0:
+            c.showPage()
+            c.setFont("Helvetica-Bold", 18)
+            c.drawString(margin, page_h - margin, "Catálogo de Inventario")
+            c.setFont("Helvetica", 9)
+            c.drawRightString(page_w - margin, page_h - margin + 0.1*cm, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        col = pos % 2
+        row = pos // 2
+        x = margin + col * (card_w + gap_x)
+        y = start_y - row * (card_h + gap_y) - card_h
+
+        c.roundRect(x, y, card_w, card_h, 8, stroke=1, fill=0)
+        # Foto
+        img_reader = data_url_to_image_reader(item["foto"])
+        photo_x, photo_y = x + 0.35*cm, y + 2.7*cm
+        photo_w, photo_h = card_w - 0.7*cm, 4.6*cm
+        if img_reader:
+            try:
+                c.drawImage(img_reader, photo_x, photo_y, width=photo_w, height=photo_h, preserveAspectRatio=True, anchor="c")
+            except Exception:
+                c.setFont("Helvetica", 8); c.drawCentredString(x+card_w/2, photo_y+photo_h/2, "Foto no disponible")
+        else:
+            c.setFont("Helvetica", 8); c.drawCentredString(x+card_w/2, photo_y+photo_h/2, "Sin foto")
+
+        # QR modelo
+        qr_png = qr_image_bytes(item["qr_texto"], box_size=5)
+        qr_img = Image.open(io.BytesIO(qr_png))
+        qr_size = 1.45 * cm
+        c.drawInlineImage(qr_img, x + card_w - qr_size - 0.25*cm, y + 0.3*cm, width=qr_size, height=qr_size)
+
+        tx = x + 0.35*cm
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(tx, y + 2.25*cm, item["codigo_base"][:18])
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(tx, y + 1.9*cm, item["producto"][:28])
+        c.setFont("Helvetica", 7)
+        marca = item["marca"][:28]
+        if marca:
+            c.drawString(tx, y + 1.55*cm, marca)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(tx, y + 1.18*cm, f"${item['precio']:,.2f}")
+        c.setFont("Helvetica", 7)
+        c.drawString(tx, y + 0.82*cm, f"Disponibles: {item['disponibles']}")
+        c.drawString(tx, y + 0.48*cm, item["tallas"][:42])
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
 def reportes_tab(inventario: pd.DataFrame, clientes: pd.DataFrame, movimientos: pd.DataFrame) -> None:
     st.header("Reportes y respaldo")
     if not can("reportes"):
@@ -630,6 +750,16 @@ def reportes_tab(inventario: pd.DataFrame, clientes: pd.DataFrame, movimientos: 
     st.subheader("Inventario por estado")
     if not inventario.empty:
         st.dataframe(inventario.groupby("estado").agg(piezas=("codigo_unico", "count"), valor=("precio", "sum")).reset_index(), use_container_width=True, hide_index=True)
+
+    st.subheader("Catálogo PDF por modelo")
+    st.caption("Agrupa por modelo, muestra una foto representativa, QR de modelo, precio y cantidad disponible. Si luego cargas tallas, las mostrará automáticamente.")
+    catalogo_pdf = create_catalogo_modelos_pdf(inventario)
+    st.download_button(
+        "Descargar catálogo PDF por modelo",
+        data=catalogo_pdf,
+        file_name=f"catalogo_concha_modelos_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        mime="application/pdf",
+    )
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
