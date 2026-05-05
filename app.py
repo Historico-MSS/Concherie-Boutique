@@ -89,8 +89,19 @@ def empty_df(sheet: str) -> pd.DataFrame:
     return pd.DataFrame(columns=mapping[sheet])
 
 
+def storage_mode() -> str:
+    # Por defecto trabajamos en modo local para evitar errores de escritura en Google Sheets
+    # hasta que las credenciales queden configuradas.
+    try:
+        return str(st.secrets.get("storage_mode", "local")).lower().strip()
+    except Exception:
+        return "local"
+
+
 @st.cache_resource(show_spinner=False)
 def get_connection():
+    if storage_mode() != "gsheets":
+        return None
     if GSheetsConnection is None:
         return None
     try:
@@ -126,8 +137,13 @@ def write_sheet(sheet: str, df: pd.DataFrame) -> None:
     df = df.copy()
     conn = get_connection()
     if conn is not None:
-        conn.update(worksheet=sheet, data=df)
-        return
+        try:
+            conn.update(worksheet=sheet, data=df)
+            return
+        except Exception as e:
+            # Si Google Sheets no permite escritura todavía, guardamos en respaldo local
+            # para que la app siga funcionando mientras configuramos credenciales.
+            st.warning(f"No pude escribir en Google Sheets. Guardé en respaldo local. Detalle: {type(e).__name__}")
     import os
     os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
     df.to_csv(local_path(sheet), index=False)
