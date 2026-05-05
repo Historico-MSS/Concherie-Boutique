@@ -154,7 +154,15 @@ def ensure_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     for col in columns:
         if col not in df.columns:
             df[col] = ""
-    return df[columns]
+    df = df[columns]
+    # Pandas/Streamlit Cloud puede inferir columnas vacías como numéricas.
+    # Para poder guardar fotos en base64/data-url y textos largos, forzamos
+    # las columnas no numéricas a dtype object/string antes de asignar valores.
+    numeric_cols = {"precio", "monto_pagado", "saldo", "monto"}
+    for col in df.columns:
+        if col not in numeric_cols:
+            df[col] = df[col].fillna("").astype("object")
+    return df
 
 
 def load_all() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -574,8 +582,10 @@ def fotos_tab(inventario: pd.DataFrame, fotos: pd.DataFrame) -> None:
             inv = ensure_columns(read_sheet("inventario"), INVENTARIO_COLUMNS)
             match = inv.index[inv["codigo_unico"].astype(str) == codigo]
             if len(match):
-                inv.loc[match[0], "foto_principal"] = data_url
-                inv.loc[match[0], "fecha_actualizacion"] = now_str()
+                row_idx = match[0]
+                inv["foto_principal"] = inv["foto_principal"].astype("object")
+                inv.at[row_idx, "foto_principal"] = data_url
+                inv.at[row_idx, "fecha_actualizacion"] = now_str()
                 write_sheet("inventario", inv)
             append_movimiento("foto", codigo_unico=codigo, detalle=f"Foto guardada: {uploaded.name}")
             st.success("Foto guardada.")
