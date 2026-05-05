@@ -687,29 +687,75 @@ def consulta_qr_tab(inventario: pd.DataFrame) -> None:
         st.warning("Todavía no hay inventario cargado.")
         return
 
-    st.caption("Escanea o sube una foto del QR. También puedes escribir el código manualmente si la cámara no lo lee.")
+    st.caption(
+        "Escanea el QR con el iPhone. Cuando la app lo lea, cambiará automáticamente "
+        "a la ficha de la pieza/modelo y no dejará la foto del QR expuesta."
+    )
 
-    scanned_text = ""
-    tab1, tab2 = st.tabs(["Cámara / foto", "Código manual"])
-    with tab1:
-        camera_file = st.camera_input("Tomar foto del QR")
-        uploaded_file = st.file_uploader("O subir imagen del QR", type=["jpg", "jpeg", "png"], key="qr_upload")
-        qr_source = camera_file or uploaded_file
-        if qr_source:
-            scanned_text = decode_qr_from_image(qr_source)
-            if scanned_text:
-                st.success(f"QR leído: {scanned_text}")
-            else:
-                st.warning("No pude leer el QR en esa imagen. Prueba acercarlo, mejorar la luz o escribir el código manualmente.")
-    with tab2:
-        manual = st.text_input("Código o texto del QR", placeholder="Ej: MARCA|ISH01-01 o ISH01-01")
-        if manual:
-            scanned_text = manual
+    if "qr_lookup_code" not in st.session_state:
+        st.session_state["qr_lookup_code"] = ""
+    if "qr_camera_nonce" not in st.session_state:
+        st.session_state["qr_camera_nonce"] = 0
+
+    def clear_qr_lookup():
+        st.session_state["qr_lookup_code"] = ""
+        st.session_state["qr_camera_nonce"] = st.session_state.get("qr_camera_nonce", 0) + 1
+
+    # Si ya hay un QR leído, NO mostramos la foto/cámara. Mostramos directo la ficha.
+    scanned_text = str(st.session_state.get("qr_lookup_code", "")).strip()
+
+    if not scanned_text:
+        st.info(
+            "En iPhone, usa la cámara trasera/regular cuando se abra la cámara. "
+            "Streamlit no siempre permite forzarla desde código, pero esta pantalla está pensada para escanear con la cámara trasera."
+        )
+        tab1, tab2 = st.tabs(["Escanear", "Código manual"])
+        with tab1:
+            camera_file = st.camera_input(
+                "Escanear QR con cámara trasera",
+                key=f"qr_camera_{st.session_state.get('qr_camera_nonce', 0)}",
+            )
+            uploaded_file = st.file_uploader(
+                "O subir imagen del QR",
+                type=["jpg", "jpeg", "png"],
+                key=f"qr_upload_{st.session_state.get('qr_camera_nonce', 0)}",
+            )
+            qr_source = camera_file or uploaded_file
+            if qr_source:
+                decoded = decode_qr_from_image(qr_source)
+                if decoded:
+                    st.session_state["qr_lookup_code"] = decoded
+                    st.session_state["qr_camera_nonce"] = st.session_state.get("qr_camera_nonce", 0) + 1
+                    st.rerun()
+                else:
+                    st.warning("No pude leer el QR. Prueba con mejor luz, más cerca, o usa el código manual.")
+        with tab2:
+            with st.form("manual_qr_lookup"):
+                manual = st.text_input("Código o texto del QR", placeholder="Ej: MARCA|ISH01-01 o ISH01-01")
+                submit_manual = st.form_submit_button("Buscar")
+            if submit_manual and manual.strip():
+                st.session_state["qr_lookup_code"] = manual.strip()
+                st.rerun()
+
+        if not st.session_state.get("qr_lookup_code"):
+            st.info("Cuando escanees o escribas un código, aquí aparecerá la pieza.")
+        return
 
     brand, code = normalize_scanned_code(scanned_text)
     if not code:
-        st.info("Cuando escanees o escribas un código, aquí aparecerá la pieza.")
+        st.warning("El QR no contiene un código válido.")
+        if st.button("Escanear otra vez"):
+            clear_qr_lookup()
+            st.rerun()
         return
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        st.success(f"Código leído: {scanned_text}")
+    with col_b:
+        if st.button("Escanear otra pieza"):
+            clear_qr_lookup()
+            st.rerun()
 
     df = inventario.copy()
     mask = df["codigo_unico"].astype(str).str.upper().str.strip() == code
@@ -730,6 +776,10 @@ def consulta_qr_tab(inventario: pd.DataFrame) -> None:
             precio_txt = f"${float(precio.mode().iloc[0] if not precio.mode().empty else precio.iloc[0]):,.2f}" if not precio.empty else "—"
             st.write(f"**Disponibles:** {disponibles}")
             st.write(f"**Precio:** {precio_txt}")
+            tallas = model_matches[model_matches["estado"].astype(str) == "disponible"]["talla"].fillna("").astype(str).str.strip()
+            tallas = tallas[tallas != ""]
+            if not tallas.empty:
+                st.write("**Tallas disponibles:** " + ", ".join([f"{t}: {n}" for t, n in tallas.value_counts().sort_index().items()]))
             st.dataframe(
                 model_matches[["marca", "codigo_unico", "producto", "talla", "precio", "estado", "ubicacion"]],
                 use_container_width=True,
@@ -773,8 +823,8 @@ def consulta_qr_tab(inventario: pd.DataFrame) -> None:
             write_sheet("inventario", inventario)
             append_movimiento(accion, codigo_unico=str(row["codigo_unico"]), detalle=f"QR - Cliente: {cliente_nombre}", monto=monto_pagado, precio=precio, saldo=saldo)
             st.success("Acción guardada.")
+            st.session_state["qr_lookup_code"] = ""
             st.rerun()
-
 
 def qr_tab(inventario: pd.DataFrame) -> None:
     st.header("QR para imprimir")
