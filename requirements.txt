@@ -5,7 +5,5 @@ st-gsheets-connection>=0.0.4
 qrcode[pil]>=7.4
 Pillow>=10.0
 reportlab>=4.0
-requests>=2.31
 opencv-python-headless>=4.8
-
-numpy>=1.24
+requests>=2.31
