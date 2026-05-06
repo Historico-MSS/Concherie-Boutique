@@ -1,1032 +1,709 @@
+import base64
+import io
 import os
 import re
-import uuid
-import math
-import base64
-import mimetypes
-from io import BytesIO
-from datetime import datetime, date
+import unicodedata
+from datetime import datetime
+from typing import Optional, Tuple
 
+import cv2
+import numpy as np
 import pandas as pd
+import qrcode
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from streamlit_gsheets import GSheetsConnection
 
 # ============================================================
 # CONFIG
 # ============================================================
-st.set_page_config(page_title="Concherie Boutique", page_icon="🏷️", layout="wide")
+st.set_page_config(page_title="Concherie", page_icon="🏷️", layout="wide")
 
 USERS = {
-    "jc": {"password": "master", "role": "admin", "label": "JC"},
-    "ventas": {"password": "moira", "role": "ventas", "label": "Ventas"},
-    "info": {"password": "precio", "role": "info", "label": "Info"},
+    "jc": {"password": "master", "role": "admin"},
+    "ventas": {"password": "moira", "role": "ventas"},
+    "info": {"password": "precio", "role": "info"},
 }
 
-VALID_STATES = ["disponible", "apartado", "vendido", "probando", "mantenimiento"]
-PAYMENT_METHODS = ["Efectivo", "Transferencia", "Otro"]
-
-INVENTORY_COLUMNS = [
-    "numero", "codigo", "codigo_interno", "producto", "color", "talla", "precio",
-    "estado", "cliente_id", "nota_id", "fecha_apartado", "fecha_venta", "descuento_pct",
-    "foto_url", "notas", "fecha_actualizacion"
+INVENTORY_SHEET = "inventario"
+REQUIRED_COLUMNS = [
+    "numero",
+    "codigo_interno",
+    "codigo",
+    "producto",
+    "color",
+    "talla",
+    "precio",
+    "foto_url",
+    "fecha_actualizacion",
 ]
-CLIENT_COLUMNS = ["cliente_id", "nombre", "telefono", "email", "notas", "fecha_creacion"]
-NOTES_COLUMNS = [
-    "nota_id", "cliente_id", "cliente_nombre", "fecha_creacion", "estado",
-    "total_venta", "total_apartado", "pagado", "saldo", "pdf_url", "fecha_actualizacion"
-]
-SALES_COLUMNS = [
-    "linea_id", "nota_id", "cliente_id", "fecha", "tipo", "numero", "codigo", "codigo_interno",
-    "producto", "color", "talla", "precio", "descuento_pct", "descuento_monto", "neto", "estado"
-]
-PAYMENTS_COLUMNS = [
-    "pago_id", "nota_id", "cliente_id", "fecha", "monto", "metodo", "nota", "soporte_url", "usuario"
-]
-MOVEMENT_COLUMNS = ["fecha", "usuario", "tipo", "referencia", "detalle"]
 
 # ============================================================
 # HELPERS
 # ============================================================
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def clean(x):
-    if x is None:
+def clean_text(x):
+    if pd.isna(x):
         return ""
-    s = str(x).strip()
-    return "" if s.lower() in ["nan", "none", "null"] else s
+    return str(x).strip()
 
 
-def money(x):
+def slugify(text):
+    text = clean_text(text)
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "archivo"
+
+
+def normalize_numero(value):
+    s = clean_text(value)
+    if not s:
+        return ""
     try:
-        return f"${float(x):,.2f}"
+        if re.fullmatch(r"\d+\.0", s):
+            s = str(int(float(s)))
+        elif re.fullmatch(r"\d+(\.\d+)?", s):
+            # 66 -> 066, 1 -> 001, 066 -> 066
+            s = str(int(float(s)))
+    except Exception:
+        pass
+    if s.isdigit():
+        return s.zfill(3)
+    m = re.search(r"(\d{1,3})$", s)
+    if m:
+        return m.group(1).zfill(3)
+    return s
+
+
+def display_talla(talla):
+    t = clean_text(talla)
+    if not t or t.upper() in ["T0", "0", "SIN TALLA", "NAN", "NONE"]:
+        return "Talla Única"
+    return t
+
+
+def money(v):
+    try:
+        return f"${float(v):,.2f}"
     except Exception:
         return "$0.00"
 
 
-def fnum(x, default=0.0):
+def parse_price(v):
+    if pd.isna(v):
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).replace("$", "").replace(",", "").strip()
     try:
-        if x is None or x == "":
-            return default
-        return float(x)
+        return float(s)
     except Exception:
-        return default
+        return 0.0
 
 
-def inum(x, default=0):
-    try:
-        if x is None or x == "":
-            return default
-        return int(float(x))
-    except Exception:
-        return default
-
-
-def num_code(x):
-    """Always return the visible 3-digit code: 1, 1.0, 001 -> 001."""
-    s = clean(x)
-    if not s:
-        return ""
-    try:
-        return f"{int(float(s)):03d}"
-    except Exception:
-        m = re.search(r"(\d{1,3})(?:\.0)?$", s)
-        return f"{int(m.group(1)):03d}" if m else s
-
-
-def code_int(x):
-    try:
-        return int(float(clean(x)))
-    except Exception:
-        m = re.search(r"(\d{1,3})(?:\.0)?$", clean(x))
-        return int(m.group(1)) if m else 0
-
-
-def display_talla(t):
-    t = clean(t)
-    if not t or t in ["T0", "0", "TU", "ÚNICA", "UNICA"]:
-        return "Talla Única"
-    return t if t.startswith("T") else f"T{t}"
-
-
-def slug(text):
-    text = clean(text)
-    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
-    return text.strip("_") or "archivo"
-
-
-def calc_discount_amount(price, pct):
-    price = fnum(price)
-    pct = fnum(pct)
-    return round(price * pct / 100, 2)
-
-
-def calc_net(price, pct):
-    return round(fnum(price) - calc_discount_amount(price, pct), 2)
-
-
-def set_page(page):
-    st.session_state.page = page
-    st.rerun()
-
-
-def role():
-    return st.session_state.get("role", "")
-
-
-def is_admin():
-    return role() == "admin"
-
-
-def can_sell():
-    return role() in ["admin", "ventas"]
-
-
-def ensure_cols(df, cols):
-    if df is None or not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(columns=cols)
+def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=REQUIRED_COLUMNS)
     df = df.copy()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    return df[cols]
+    df.columns = [clean_text(c).lower().replace(" ", "_") for c in df.columns]
+    aliases = {
+        "marca/maison": "marca",
+        "maison": "marca",
+        "cod": "codigo",
+        "código": "codigo",
+        "codigo_modelo": "codigo",
+        "articulo": "producto",
+        "artículo": "producto",
+        "descripcion": "producto",
+        "descripción": "producto",
+        "colour": "color",
+        "size": "talla",
+        "price": "precio",
+        "photo": "foto_url",
+    }
+    df = df.rename(columns={c: aliases.get(c, c) for c in df.columns})
 
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col != "precio" else 0.0
 
-def normalize_numeric(df):
-    for c in ["precio", "descuento_pct", "total_venta", "total_apartado", "pagado", "saldo", "descuento_monto", "neto", "monto"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
-    return df
+    df["numero"] = df.apply(lambda r: normalize_numero(r.get("numero")) or normalize_numero(r.get("codigo_interno")), axis=1)
+    df["codigo"] = df["codigo"].apply(clean_text).str.upper()
+    df["producto"] = df["producto"].apply(clean_text).str.upper()
+    df["color"] = df["color"].apply(clean_text).str.upper()
+    df["talla"] = df["talla"].apply(lambda x: display_talla(x))
+    df["precio"] = df["precio"].apply(parse_price)
+    df["foto_url"] = df["foto_url"].apply(clean_text)
+
+    def make_internal(r):
+        existing = clean_text(r.get("codigo_interno"))
+        if existing and existing.lower() not in ["nan", "none"]:
+            # Normalize ending only if needed
+            parts = existing.split("-")
+            if parts:
+                parts[-1] = normalize_numero(parts[-1])
+                return "-".join(parts).upper()
+        codigo = clean_text(r.get("codigo")).upper() or "SINCODIGO"
+        color = clean_text(r.get("color")).upper() or "SINCOLOR"
+        talla = clean_text(r.get("talla"))
+        talla_code = "T0" if talla == "Talla Única" else talla.upper()
+        numero = normalize_numero(r.get("numero"))
+        return f"{codigo}-{color}-{talla_code}-{numero}".upper()
+
+    df["codigo_interno"] = df.apply(make_internal, axis=1)
+    df["fecha_actualizacion"] = df["fecha_actualizacion"].apply(clean_text)
+
+    return df[REQUIRED_COLUMNS].sort_values("codigo_interno").reset_index(drop=True)
+
 
 # ============================================================
-# STORAGE: GOOGLE SHEETS
+# DATA
 # ============================================================
-def gsheets_configured():
-    try:
-        return "connections" in st.secrets and "gsheets" in st.secrets["connections"]
-    except Exception:
-        return False
-
-
-@st.cache_resource
-def get_gsheets_connection():
-    from streamlit_gsheets import GSheetsConnection
+def get_gsheets_conn():
     return st.connection("gsheets", type=GSheetsConnection)
 
 
-def local_path(name):
-    os.makedirs("data", exist_ok=True)
-    return os.path.join("data", f"{name}.csv")
+def load_inventory() -> pd.DataFrame:
+    try:
+        conn = get_gsheets_conn()
+        df = conn.read(worksheet=INVENTORY_SHEET, ttl=0)
+        st.session_state.data_status = "Google Sheets"
+        return ensure_inventory_schema(df)
+    except Exception as e:
+        st.session_state.data_status = f"Local / error Sheets: {str(e)[:120]}"
+        if "inventario" not in st.session_state:
+            st.session_state.inventario = pd.DataFrame(columns=REQUIRED_COLUMNS)
+        return ensure_inventory_schema(st.session_state.inventario)
 
 
-def load_table(name, cols):
-    if gsheets_configured():
-        try:
-            conn = get_gsheets_connection()
-            df = conn.read(worksheet=name, ttl=0)
-            if df is None:
-                df = pd.DataFrame(columns=cols)
-            if "Unnamed: 0" in df.columns:
-                df = df.drop(columns=["Unnamed: 0"])
-            return normalize_numeric(ensure_cols(df, cols))
-        except Exception as e:
-            st.session_state.storage_warning = f"No pude leer Google Sheets; usando local. {name}: {e}"
-    path = local_path(name)
-    if os.path.exists(path):
-        try:
-            return normalize_numeric(ensure_cols(pd.read_csv(path), cols))
-        except Exception:
-            pass
-    return pd.DataFrame(columns=cols)
+def save_inventory(df: pd.DataFrame):
+    df = ensure_inventory_schema(df)
+    st.session_state.inventario = df
+    try:
+        conn = get_gsheets_conn()
+        conn.update(worksheet=INVENTORY_SHEET, data=df)
+        st.session_state.data_status = "Google Sheets"
+        return True, "Guardado en Google Sheets"
+    except Exception as e:
+        st.session_state.data_status = f"Local / error Sheets: {str(e)[:120]}"
+        return False, str(e)
 
-
-def save_table(name, df, cols):
-    df = normalize_numeric(ensure_cols(df, cols))
-    if gsheets_configured():
-        try:
-            conn = get_gsheets_connection()
-            conn.update(worksheet=name, data=df)
-            return True, "Guardado en Google Sheets"
-        except Exception as e:
-            st.session_state.storage_warning = f"No pude guardar en Google Sheets; guardé local. {name}: {e}"
-    df.to_csv(local_path(name), index=False)
-    return True, "Guardado local"
-
-
-def load_all():
-    if st.session_state.get("loaded"):
-        return
-    st.session_state.inventario = load_table("inventario", INVENTORY_COLUMNS)
-    st.session_state.clientes = load_table("clientes", CLIENT_COLUMNS)
-    st.session_state.notas = load_table("notas", NOTES_COLUMNS)
-    st.session_state.ventas = load_table("ventas", SALES_COLUMNS)
-    st.session_state.pagos = load_table("pagos", PAYMENTS_COLUMNS)
-    st.session_state.movimientos = load_table("movimientos", MOVEMENT_COLUMNS)
-    st.session_state.loaded = True
-
-
-def save_inventory(): return save_table("inventario", st.session_state.inventario, INVENTORY_COLUMNS)
-def save_clients(): return save_table("clientes", st.session_state.clientes, CLIENT_COLUMNS)
-def save_notes(): return save_table("notas", st.session_state.notas, NOTES_COLUMNS)
-def save_sales(): return save_table("ventas", st.session_state.ventas, SALES_COLUMNS)
-def save_payments(): return save_table("pagos", st.session_state.pagos, PAYMENTS_COLUMNS)
-def save_movements(): return save_table("movimientos", st.session_state.movimientos, MOVEMENT_COLUMNS)
-
-
-def log(tipo, referencia="", detalle=""):
-    row = {"fecha": now_str(), "usuario": st.session_state.get("user", ""), "tipo": tipo, "referencia": referencia, "detalle": detalle}
-    st.session_state.movimientos = pd.concat([st.session_state.movimientos, pd.DataFrame([row])], ignore_index=True)
-    save_movements()
 
 # ============================================================
 # SUPABASE STORAGE
 # ============================================================
 def supabase_configured():
-    try:
-        return "supabase" in st.secrets and st.secrets["supabase"].get("url") and st.secrets["supabase"].get("key")
-    except Exception:
-        return False
+    return "supabase" in st.secrets and all(k in st.secrets["supabase"] for k in ["url", "key", "bucket"])
 
 
-def supabase_public_url(path):
+def supabase_upload_bytes(data: bytes, path: str, content_type: str) -> Optional[str]:
+    if not supabase_configured():
+        return None
     url = st.secrets["supabase"]["url"].rstrip("/")
-    bucket = st.secrets["supabase"].get("bucket", "concherie-files")
+    key = st.secrets["supabase"]["key"]
+    bucket = st.secrets["supabase"]["bucket"]
+    api_url = f"{url}/storage/v1/object/{bucket}/{path}"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    r = requests.post(api_url, headers=headers, data=data, timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Supabase error {r.status_code}: {r.text[:300]}")
     return f"{url}/storage/v1/object/public/{bucket}/{path}"
 
 
-def upload_to_supabase(data_bytes, path, content_type="application/octet-stream"):
-    if not supabase_configured():
-        return "", "Supabase no está configurado"
-    url = st.secrets["supabase"]["url"].rstrip("/")
-    key = st.secrets["supabase"]["key"]
-    bucket = st.secrets["supabase"].get("bucket", "concherie-files")
-    endpoint = f"{url}/storage/v1/object/{bucket}/{path}"
-    headers = {"Authorization": f"Bearer {key}", "apikey": key, "Content-Type": content_type, "x-upsert": "true"}
-    try:
-        r = requests.post(endpoint, headers=headers, data=data_bytes, timeout=30)
-        if r.status_code not in [200, 201]:
-            return "", f"Supabase error {r.status_code}: {r.text[:250]}"
-        return supabase_public_url(path), ""
-    except Exception as e:
-        return "", str(e)
-
-
-def compress_image(uploaded_file, max_size=1400, quality=80):
+def compress_image(uploaded_file) -> Tuple[bytes, str]:
     img = Image.open(uploaded_file)
+    img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
-    w, h = img.size
-    scale = min(max_size / max(w, h), 1.0)
-    if scale < 1:
-        img = img.resize((int(w * scale), int(h * scale)))
-    bio = BytesIO()
-    img.save(bio, format="JPEG", quality=quality, optimize=True)
-    return bio.getvalue(), "image/jpeg"
+    img.thumbnail((1400, 1400))
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=82, optimize=True)
+    return out.getvalue(), "image/jpeg"
+
+
+def upload_product_photo(uploaded_file, numero, producto):
+    data, content_type = compress_image(uploaded_file)
+    filename = f"{normalize_numero(numero)}_{slugify(producto)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    path = f"productos/{filename}"
+    return supabase_upload_bytes(data, path, content_type)
+
 
 # ============================================================
-# IDs AND BUSINESS LOGIC
+# QR / PDF
 # ============================================================
-def next_numeric_code():
-    inv = st.session_state.inventario
-    nums = []
-    for v in inv.get("numero", pd.Series(dtype=str)).astype(str):
-        n = code_int(v)
-        if n: nums.append(n)
-    n = max(nums) + 1 if nums else 1
-    return f"{n:03d}"
-
-
-def next_client_id():
-    clients = st.session_state.clientes
-    nums = []
-    for v in clients.get("cliente_id", pd.Series(dtype=str)).astype(str):
-        m = re.search(r"CL-(\d+)", v)
-        if m: nums.append(int(m.group(1)))
-    n = max(nums) + 1 if nums else 1
-    return f"CL-{n:03d}"
-
-
-def next_note_id():
-    notes = st.session_state.notas
-    nums = []
-    for v in notes.get("nota_id", pd.Series(dtype=str)).astype(str):
-        m = re.search(r"NV-(\d+)", v)
-        if m: nums.append(int(m.group(1)))
-    n = max(nums) + 1 if nums else 1
-    return f"NV-{n:04d}"
-
-
-def get_client_name(client_id):
-    if not clean(client_id): return ""
-    df = st.session_state.clientes
-    row = df[df["cliente_id"].astype(str) == str(client_id)]
-    return clean(row.iloc[0]["nombre"]) if not row.empty else ""
-
-
-def ensure_client(nombre, telefono="", email="", notas=""):
-    nombre = clean(nombre)
-    if not nombre:
-        return ""
-    clients = st.session_state.clientes
-    existing = clients[clients["nombre"].astype(str).str.lower() == nombre.lower()]
-    if not existing.empty:
-        cid = clean(existing.iloc[0]["cliente_id"])
-        if not cid:
-            cid = next_client_id()
-            clients.loc[existing.index[0], "cliente_id"] = cid
-            save_clients()
-        return cid
-    cid = next_client_id()
-    row = {"cliente_id": cid, "nombre": nombre, "telefono": telefono, "email": email, "notas": notas, "fecha_creacion": now_str()}
-    st.session_state.clientes = pd.concat([clients, pd.DataFrame([row])], ignore_index=True)
-    save_clients()
-    log("crear_cliente", cid, nombre)
-    return cid
-
-
-def active_note_for_client(client_id):
-    notes = st.session_state.notas
-    active = notes[(notes["cliente_id"].astype(str) == str(client_id)) & (notes["estado"].astype(str) == "abierta")]
-    if not active.empty:
-        return clean(active.iloc[0]["nota_id"])
-    nid = next_note_id()
-    cname = get_client_name(client_id)
-    row = {"nota_id": nid, "cliente_id": client_id, "cliente_nombre": cname, "fecha_creacion": now_str(), "estado": "abierta", "total_venta": 0.0, "total_apartado": 0.0, "pagado": 0.0, "saldo": 0.0, "pdf_url": "", "fecha_actualizacion": now_str()}
-    st.session_state.notas = pd.concat([notes, pd.DataFrame([row])], ignore_index=True)
-    save_notes()
-    log("crear_nota", nid, f"Cliente {client_id}")
-    return nid
-
-
-def recalc_note(nota_id):
-    sales = st.session_state.ventas[st.session_state.ventas["nota_id"].astype(str) == str(nota_id)].copy()
-    payments = st.session_state.pagos[st.session_state.pagos["nota_id"].astype(str) == str(nota_id)].copy()
-    total_venta = sales[sales["tipo"] == "venta"]["neto"].astype(float).sum() if not sales.empty else 0.0
-    total_apartado = sales[sales["tipo"] == "apartado"]["neto"].astype(float).sum() if not sales.empty else 0.0
-    pagado = payments["monto"].astype(float).sum() if not payments.empty else 0.0
-    saldo = total_venta - pagado
-    notes = st.session_state.notas
-    idxs = notes[notes["nota_id"].astype(str) == str(nota_id)].index
-    if len(idxs):
-        idx = idxs[0]
-        notes.at[idx, "total_venta"] = round(total_venta, 2)
-        notes.at[idx, "total_apartado"] = round(total_apartado, 2)
-        notes.at[idx, "pagado"] = round(pagado, 2)
-        notes.at[idx, "saldo"] = round(saldo, 2)
-        notes.at[idx, "fecha_actualizacion"] = now_str()
-        if saldo <= 0 and total_venta > 0:
-            notes.at[idx, "estado"] = "pagada"
-    st.session_state.notas = notes
-    save_notes()
-
-
-def find_piece(query):
-    q = clean(query)
-    inv = st.session_state.inventario
-    if not q or inv.empty:
-        return None, pd.DataFrame()
-    qn = num_code(q)
-    if qn:
-        exact = inv[inv["numero"].apply(num_code) == qn]
-        if not exact.empty:
-            return exact.index[0], exact
-    mask = inv.apply(lambda r: q.lower() in " ".join([str(v).lower() for v in r.values]), axis=1)
-    res = inv[mask]
-    if len(res) == 1:
-        return res.index[0], res
-    return None, res
-
-# ============================================================
-# PDFS AND QR
-# ============================================================
-def qr_png_bytes(text):
-    import qrcode
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=12, border=2)
-    qr.add_data(clean(text))
+def make_qr_image(payload: str, box_size=10):
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=box_size, border=2)
+    qr.add_data(payload)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
-    bio = BytesIO()
-    img.save(bio, "PNG")
-    return bio.getvalue()
+    return qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
 
-def create_labels_pdf(data):
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import cm
-    from reportlab.lib.utils import ImageReader
+def pil_to_reader(img):
+    b = io.BytesIO()
+    img.save(b, format="PNG")
+    b.seek(0)
+    return ImageReader(b)
 
-    data = data.copy().sort_values("codigo_interno")
-    bio = BytesIO(); c = canvas.Canvas(bio, pagesize=letter)
-    W, H = letter
-    label_w, label_h = 8*cm, 5*cm
-    qr_size = 4*cm
-    margin_x, margin_y = 0.4*cm, 0.6*cm
+
+def build_labels_pdf(df: pd.DataFrame) -> bytes:
+    df = ensure_inventory_schema(df).sort_values("codigo_interno")
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    page_w, page_h = A4
+
+    label_w = 8 * cm
+    label_h = 5 * cm
+    margin_x = (page_w - 2 * label_w) / 2
+    top_margin = 0.8 * cm
+    rows = 5
     cols = 2
-    rows = int((H - margin_y*2) // label_h)
-    per_page = cols * rows
 
     def draw_grid():
-        c.setDash(2, 2); c.setLineWidth(0.35)
-        # vertical cut line between columns
-        x = margin_x + label_w
-        c.line(x, margin_y, x, H-margin_y)
-        # horizontal lines
+        c.setDash(2, 3)
+        c.setStrokeColorRGB(0.45, 0.45, 0.45)
+        c.setLineWidth(0.6)
+        mid_x = margin_x + label_w
+        c.line(mid_x, top_margin, mid_x, page_h - top_margin)
         for r in range(1, rows):
-            y = H - margin_y - r*label_h
-            c.line(margin_x, y, margin_x + cols*label_w, y)
+            y = page_h - top_margin - r * label_h
+            c.line(margin_x, y, margin_x + 2 * label_w, y)
         c.setDash()
 
     draw_grid()
-    for i, (_, r) in enumerate(data.iterrows()):
-        if i > 0 and i % per_page == 0:
-            c.showPage(); draw_grid()
-        pos = i % per_page
-        col = pos % cols; row = pos // cols
-        x0 = margin_x + col*label_w
-        y0 = H - margin_y - (row+1)*label_h
-        qr = ImageReader(BytesIO(qr_png_bytes(num_code(r.get("numero")) or num_code(r.get("codigo_interno")))))
-        c.drawImage(qr, x0+0.35*cm, y0+0.5*cm, qr_size, qr_size, preserveAspectRatio=True, mask='auto')
-        tx = x0 + 4.7*cm
-        c.setFont("Helvetica-Bold", 27)
-        c.drawString(tx, y0 + 3.75*cm, num_code(r.get("numero")) or num_code(r.get("codigo_interno")))
-        c.setFont("Helvetica-Bold", 8.5)
-        c.drawString(tx, y0 + 3.20*cm, clean(r["producto"])[:24])
-        c.setFont("Helvetica", 8.5)
-        c.drawString(tx, y0 + 2.78*cm, clean(r["color"])[:18])
-        c.drawString(tx, y0 + 2.38*cm, display_talla(r["talla"])[:18])
-        c.setFont("Helvetica", 5.8)
-        c.drawString(tx, y0 + 0.68*cm, clean(r["codigo_interno"])[:32])
-    c.save(); bio.seek(0); return bio.getvalue()
+    idx = 0
+    for _, row in df.iterrows():
+        pos = idx % (rows * cols)
+        if idx > 0 and pos == 0:
+            c.showPage()
+            draw_grid()
+        col = pos % cols
+        rr = pos // cols
+        x = margin_x + col * label_w
+        y_top = page_h - top_margin - rr * label_h
+        y = y_top - label_h
+
+        numero = normalize_numero(row["numero"])
+        producto = clean_text(row["producto"])
+        color = clean_text(row["color"])
+        talla = display_talla(row["talla"])
+        interno = clean_text(row["codigo_interno"])
+
+        qr_img = make_qr_image(numero, box_size=8)
+        qr_size = 3.55 * cm
+        qr_x = x + 0.28 * cm
+        qr_y = y + 0.65 * cm
+        c.drawImage(pil_to_reader(qr_img), qr_x, qr_y, width=qr_size, height=qr_size, mask="auto")
+
+        tx = x + 4.15 * cm
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 24)
+        c.drawString(tx, y_top - 0.85 * cm, numero)
+
+        c.setFont("Helvetica-Bold", 7.2)
+        text_obj = c.beginText(tx, y_top - 1.35 * cm)
+        text_obj.setLeading(8)
+        # wrap product in max 2 lines
+        prod_words = producto.split()
+        lines = []
+        line = ""
+        for w in prod_words:
+            test = f"{line} {w}".strip()
+            if len(test) > 20 and line:
+                lines.append(line)
+                line = w
+            else:
+                line = test
+        if line:
+            lines.append(line)
+        for l in lines[:2]:
+            text_obj.textLine(l)
+        c.drawText(text_obj)
+
+        c.setFont("Helvetica", 7.5)
+        c.drawString(tx, y_top - 2.25 * cm, color[:22])
+        c.drawString(tx, y_top - 2.65 * cm, talla[:22])
+        c.setFont("Helvetica", 5.2)
+        c.drawRightString(x + label_w - 0.25 * cm, y + 0.25 * cm, interno[:38])
+        idx += 1
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
-def create_note_pdf(nota_id, disclaimer=True):
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
+def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="") -> bytes:
+    df = ensure_inventory_schema(df)
+    if talla_filter.strip():
+        tf = talla_filter.strip().upper()
+        df = df[df["talla"].astype(str).str.upper().str.contains(tf, na=False)]
+    df = df.sort_values(["producto", "color", "talla", "numero"])
 
-    notes = st.session_state.notas
-    note = notes[notes["nota_id"].astype(str) == str(nota_id)]
-    if note.empty:
-        return b""
-    n = note.iloc[0]
-    cliente = clean(n["cliente_nombre"]) or get_client_name(n["cliente_id"])
-    sales = st.session_state.ventas[st.session_state.ventas["nota_id"].astype(str) == str(nota_id)].copy()
-    payments = st.session_state.pagos[st.session_state.pagos["nota_id"].astype(str) == str(nota_id)].copy()
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    w, h = A4
+    margin = 1.3 * cm
+    card_w = (w - 2 * margin - 0.7 * cm) / 2
+    card_h = 6.4 * cm
+    gap = 0.7 * cm
 
-    bio = BytesIO(); c = canvas.Canvas(bio, pagesize=letter); W,H = letter
-    y = H - 0.65*inch
-    c.setFont("Helvetica-Bold", 18); c.drawString(0.7*inch, y, "CONCHERIE BOUTIQUE")
-    y -= 0.32*inch
-    c.setFont("Helvetica", 10); c.drawString(0.7*inch, y, f"Nota de venta: {nota_id}")
-    c.drawRightString(7.7*inch, y, f"Fecha: {today_str()}")
-    y -= 0.25*inch
-    c.setFont("Helvetica-Bold", 10); c.drawString(0.7*inch, y, f"Cliente: {cliente}")
-    c.setFont("Helvetica", 9); c.drawRightString(7.7*inch, y, f"ID: {n['cliente_id']}")
-    y -= 0.35*inch
+    def header():
+        c.setFont("Helvetica-Bold", 20)
+        c.drawString(margin, h - margin, "CONCHERIE BOUTIQUE")
+        c.setFont("Helvetica", 10)
+        c.drawString(margin, h - margin - 0.45 * cm, "Catálogo disponible")
 
-    def section(title, df, y):
-        if df.empty: return y
-        c.setFont("Helvetica-Bold", 12); c.drawString(0.7*inch, y, title); y -= 0.22*inch
-        c.setLineWidth(0.5); c.line(0.7*inch, y, 7.7*inch, y); y -= 0.22*inch
-        for _, r in df.sort_values("fecha").iterrows():
-            if y < 1.2*inch:
-                c.showPage(); y = H - 0.7*inch
-            c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(0.8*inch, y, f"{num_code(r['numero'])} · {clean(r['producto'])[:42]}")
-            c.setFont("Helvetica", 8.5)
-            c.drawRightString(7.5*inch, y, money(r['neto']))
-            y -= 0.18*inch
-            c.drawString(0.8*inch, y, f"{clean(r['codigo_interno'])} · {display_talla(r['talla'])} · {clean(r['fecha'])[:10]}")
-            if fnum(r.get('descuento_pct',0)):
-                c.drawRightString(7.5*inch, y, f"Desc. {fnum(r['descuento_pct']):.0f}%")
-            y -= 0.25*inch
-        y -= 0.08*inch
-        return y
+    header()
+    y = h - margin - 1.3 * cm
+    col = 0
 
-    ventas = sales[sales["tipo"] == "venta"]
-    apartados = sales[sales["tipo"] == "apartado"]
-    y = section("VENTAS", ventas, y)
-    y = section("APARTADOS", apartados, y)
-    if disclaimer and not apartados.empty:
-        c.setFont("Helvetica-Oblique", 8.5)
-        c.drawString(0.8*inch, y, "Nota: las piezas apartadas se mantienen reservadas por un máximo de 10 días.")
-        y -= 0.35*inch
+    for _, row in df.iterrows():
+        if y - card_h < margin:
+            c.showPage()
+            header()
+            y = h - margin - 1.3 * cm
+            col = 0
+        x = margin + col * (card_w + gap)
 
-    if y < 1.8*inch:
-        c.showPage(); y = H - 0.7*inch
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(4.7*inch, y, "Total ventas:"); c.drawRightString(7.5*inch, y, money(n['total_venta'])); y-=0.22*inch
-    c.drawString(4.7*inch, y, "Total apartados:"); c.drawRightString(7.5*inch, y, money(n['total_apartado'])); y-=0.22*inch
-    c.drawString(4.7*inch, y, "Pagado:"); c.drawRightString(7.5*inch, y, money(n['pagado'])); y-=0.28*inch
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(4.7*inch, y, "SALDO:"); c.drawRightString(7.5*inch, y, money(n['saldo']))
-    c.save(); bio.seek(0); return bio.getvalue()
+        c.setStrokeColorRGB(0.85, 0.85, 0.85)
+        c.roundRect(x, y - card_h, card_w, card_h, 8, stroke=1, fill=0)
 
-# ============================================================
-# PAGES
-# ============================================================
-def login_page():
-    st.title("Concherie Boutique")
-    st.caption("Sistema de inventario, ventas y catálogo")
-    with st.form("login"):
-        u = st.text_input("Usuario").strip().lower()
-        p = st.text_input("Clave", type="password")
-        ok = st.form_submit_button("Entrar", use_container_width=True)
-    if ok:
-        if u in USERS and USERS[u]["password"] == p:
-            st.session_state.user = u; st.session_state.role = USERS[u]["role"]; st.session_state.page = "home"; st.rerun()
+        # photo area
+        photo_url = clean_text(row.get("foto_url"))
+        if photo_url.startswith("http"):
+            try:
+                img_data = requests.get(photo_url, timeout=10).content
+                img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                img.thumbnail((500, 500))
+                c.drawImage(pil_to_reader(img), x + 0.3 * cm, y - 3.6 * cm, width=2.9 * cm, height=2.9 * cm, preserveAspectRatio=True, anchor="c")
+            except Exception:
+                c.setFillColorRGB(0.95, 0.95, 0.95)
+                c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
         else:
-            st.error("Usuario o clave incorrectos")
+            c.setFillColorRGB(0.96, 0.96, 0.96)
+            c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
+            c.setFillColorRGB(0.45, 0.45, 0.45)
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(x + 1.75 * cm, y - 2.15 * cm, "Sin foto")
+
+        tx = x + 3.55 * cm
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawString(tx, y - 0.7 * cm, f"{normalize_numero(row['numero'])} · {clean_text(row['producto'])[:24]}")
+        c.setFont("Helvetica-Oblique", 8)
+        c.drawString(tx, y - 1.2 * cm, f"{clean_text(row['color'])} · {display_talla(row['talla'])}")
+        c.setFont("Helvetica", 7)
+        c.drawString(tx, y - 1.7 * cm, clean_text(row["codigo_interno"])[:30])
+        if include_price:
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(tx, y - 2.55 * cm, money(row["precio"]))
+        col += 1
+        if col == 2:
+            col = 0
+            y -= card_h + 0.55 * cm
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# AUTH / NAV
+# ============================================================
+def login():
+    st.title("Concherie")
+    u = st.text_input("Usuario")
+    p = st.text_input("Clave", type="password")
+    if st.button("Entrar", use_container_width=True):
+        if u in USERS and USERS[u]["password"] == p:
+            st.session_state.user = u
+            st.session_state.role = USERS[u]["role"]
+            st.session_state.page = "inicio"
+            st.rerun()
+        else:
+            st.error("Usuario o clave incorrecta")
+
+
+def can_admin():
+    return st.session_state.get("role") == "admin"
+
+
+def can_ventas():
+    return st.session_state.get("role") in ["admin", "ventas"]
+
+
+def set_page(p):
+    st.session_state.page = p
+    st.rerun()
 
 
 def sidebar():
     st.sidebar.title("Concherie")
-    st.sidebar.write(f"Usuario: **{st.session_state.get('user','')}**")
-    st.sidebar.success("Datos: Google Sheets" if gsheets_configured() else "Datos: local")
-    st.sidebar.success("Archivos: Supabase" if supabase_configured() else "Archivos: no configurado")
-    if st.session_state.get("storage_warning"):
-        st.sidebar.info(st.session_state.storage_warning)
-    buttons = [("🏠 Inicio","home"),("■ Escanear QR","escanear"),("🔎 Buscar código","buscar")]
-    if can_sell(): buttons += [("🛍️ Ventas","ventas"),("👥 Clientes","clientes"),("📄 Catálogo","catalogo")]
-    if is_admin(): buttons += [("📥 Cargar recepción","carga"),("🏷️ Generar QR","qr"),("📊 Reportes","reportes"),("⚙️ Admin","admin")]
-    for label, pg in buttons:
-        if st.sidebar.button(label, use_container_width=True): set_page(pg)
-    if st.sidebar.button("Cerrar sesión", use_container_width=True):
-        for k in ["user","role","page"]: st.session_state.pop(k, None)
-        st.rerun()
-
-
-def home_page():
-    r = role(); st.title("Concherie Boutique")
-    if r == "info":
-        st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
-        st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
-    elif r == "ventas":
-        c1,c2 = st.columns(2)
-        with c1:
-            st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
-            st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
-            st.button("🛍️ Registrar venta/apartado", use_container_width=True, on_click=lambda: set_page("ventas"))
-        with c2:
-            st.button("👥 Clientes", use_container_width=True, on_click=lambda: set_page("clientes"))
-            st.button("📄 Catálogo disponible", use_container_width=True, on_click=lambda: set_page("catalogo"))
+    st.sidebar.write(f"Usuario: **{st.session_state.get('user')}**")
+    st.sidebar.success(f"Datos: {st.session_state.get('data_status', 'Google Sheets')}")
+    if supabase_configured():
+        st.sidebar.success("Fotos: Supabase")
     else:
-        c1,c2,c3 = st.columns(3)
-        with c1:
-            st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
-            st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
-            st.button("📥 Cargar recepción", use_container_width=True, on_click=lambda: set_page("carga"))
-        with c2:
-            st.button("🏷️ Generar QR", use_container_width=True, on_click=lambda: set_page("qr"))
-            st.button("🛍️ Ventas", use_container_width=True, on_click=lambda: set_page("ventas"))
-        with c3:
-            st.button("👥 Clientes", use_container_width=True, on_click=lambda: set_page("clientes"))
-            st.button("⚙️ Admin", use_container_width=True, on_click=lambda: set_page("admin"))
-    inv = st.session_state.inventario
-    if not inv.empty:
-        c1,c2,c3 = st.columns(3)
-        c1.metric("Disponibles", len(inv[inv.estado=="disponible"]))
-        c2.metric("Apartadas", len(inv[inv.estado=="apartado"]))
-        c3.metric("Vendidas", len(inv[inv.estado=="vendido"]))
+        st.sidebar.warning("Fotos: Supabase no configurado")
+
+    buttons = [("🏠 Inicio", "inicio"), ("🔎 Buscar código", "buscar"), ("◼ Escanear QR", "scan")]
+    if can_ventas():
+        buttons += [("📸 Fotos", "fotos"), ("📄 Catálogo", "catalogo")]
+    if can_admin():
+        buttons += [("📥 Cargar inventario", "cargar"), ("🏷️ Generar QR", "qr"), ("📦 Inventario", "inventario"), ("⚙️ Admin", "admin")]
+
+    st.sidebar.divider()
+    for label, page in buttons:
+        if st.sidebar.button(label, use_container_width=True):
+            set_page(page)
+    st.sidebar.divider()
+    if st.sidebar.button("Cerrar sesión", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
 
 
-def show_piece(idx):
-    inv = st.session_state.inventario
-    r = inv.loc[idx]
-    visible_num = num_code(r.get("numero")) or num_code(r.get("codigo_interno"))
-    col1,col2 = st.columns([1,2])
+# ============================================================
+# PRODUCT DISPLAY
+# ============================================================
+def find_product(df, query):
+    q = normalize_numero(query)
+    if not q:
+        return None
+    matches = df[df["numero"].astype(str).apply(normalize_numero) == q]
+    if matches.empty:
+        # also allow internal code search
+        qq = clean_text(query).upper()
+        matches = df[df["codigo_interno"].astype(str).str.upper().str.contains(qq, na=False)]
+    if matches.empty:
+        return None
+    return matches.iloc[0]
+
+
+def show_product(row):
+    numero = normalize_numero(row["numero"])
+    st.subheader(f"{numero} · {clean_text(row['producto'])}")
+    col1, col2, col3 = st.columns([1.1, 1.4, 0.9])
     with col1:
-        url = clean(r.get("foto_url"))
-        if url: st.image(url, use_container_width=True)
-        else: st.info("Sin foto")
-        if can_sell():
-            up = st.file_uploader("Agregar foto", type=["jpg","jpeg","png","heic","heif"], key=f"photo_{idx}")
-            if up and st.button("Guardar foto", key=f"savephoto_{idx}"):
-                try:
-                    data, ct = compress_image(up)
-                    path = f"fotos/piezas/{visible_num}_{uuid.uuid4().hex[:8]}.jpg"
-                    url, err = upload_to_supabase(data, path, ct)
-                    if err:
-                        st.error(err)
-                    else:
-                        inv.at[idx,"foto_url"] = url; inv.at[idx,"fecha_actualizacion"] = now_str(); save_inventory(); st.success("Foto guardada"); st.rerun()
-                except Exception as e: st.error(f"No pude procesar la foto: {e}")
+        url = clean_text(row.get("foto_url"))
+        if url.startswith("http"):
+            st.image(url, use_container_width=True)
+        else:
+            st.info("Sin foto")
     with col2:
-        st.subheader(f"{visible_num} · {r['producto']}")
-        st.write(f"**Código interno:** {r['codigo_interno']}")
-        st.write(f"**Color:** {r['color']}")
-        st.write(f"**Talla:** {display_talla(r['talla'])}")
-        st.write(f"**Precio:** {money(r['precio'])}")
-        st.write(f"**Estado:** {r['estado']}")
-        if clean(r.get("cliente_id")):
-            cid = clean(r['cliente_id'])
-            st.write(f"**Cliente ID:** {cid}")
-            if r['estado'] == "apartado":
-                fa = clean(r.get('fecha_apartado'))[:10]
-                st.write(f"**Apartada desde:** {fa}")
-                try:
-                    days = (date.today() - datetime.strptime(fa, "%Y-%m-%d").date()).days
-                    st.write(f"**Días apartada:** {days}")
-                    if days > 10: st.warning("Apartado con más de 10 días")
-                except Exception: pass
+        st.write(f"**Código numérico:** {numero}")
+        st.write(f"**Código interno:** {clean_text(row['codigo_interno'])}")
+        st.write(f"**Modelo:** {clean_text(row['codigo'])}")
+        st.write(f"**Color:** {clean_text(row['color'])}")
+        st.write(f"**Talla:** {display_talla(row['talla'])}")
+    with col3:
+        st.metric("Precio", money(row["precio"]))
 
 
-def escanear_page():
+# ============================================================
+# PAGES
+# ============================================================
+def home_page(df):
+    st.title("Concherie Boutique")
+    st.caption("Inventario, QR, fotos y catálogo.")
+    cols = st.columns(3 if can_admin() else 2)
+    with cols[0]:
+        if st.button("◼ Escanear QR", use_container_width=True): set_page("scan")
+        if st.button("🔎 Buscar código", use_container_width=True): set_page("buscar")
+    with cols[1]:
+        if can_ventas() and st.button("📸 Fotos", use_container_width=True): set_page("fotos")
+        if can_ventas() and st.button("📄 Catálogo", use_container_width=True): set_page("catalogo")
+    if can_admin():
+        with cols[2]:
+            if st.button("🏷️ Generar QR", use_container_width=True): set_page("qr")
+            if st.button("📥 Cargar inventario", use_container_width=True): set_page("cargar")
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total piezas", len(df))
+    c2.metric("Con foto", int(df["foto_url"].astype(str).str.startswith("http").sum()) if not df.empty else 0)
+    c3.metric("Sin foto", int((~df["foto_url"].astype(str).str.startswith("http")).sum()) if not df.empty else 0)
+
+
+def search_page(df):
+    st.title("Buscar código")
+    q = st.text_input("Código numérico", placeholder="Ej: 066")
+    if q:
+        row = find_product(df, q)
+        if row is None:
+            st.error("No encontré esa pieza.")
+        else:
+            show_product(row)
+
+
+def scan_page(df):
     st.title("Escanear QR")
-    st.info("Usa la cámara para tomar la foto del QR. Si no lo lee, escribe el código numérico en Buscar código.")
-    img_file = st.camera_input("Cámara QR")
-    if img_file is not None:
-        try:
-            import cv2
-            import numpy as np
-            img = Image.open(img_file).convert("RGB")
-            arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            detector = cv2.QRCodeDetector()
-            data, bbox, _ = detector.detectAndDecode(arr)
-            if data:
-                st.success(f"Código leído: {data}")
-                idx, res = find_piece(data)
-                if idx is not None:
-                    show_piece(idx)
-                else:
-                    st.error("Leí el QR, pero no encontré la pieza en inventario.")
+    st.info("En iPhone, usa la cámara normal para leer el QR. Si prefieres, toma/sube una foto del QR aquí o escribe el código manualmente.")
+    manual = st.text_input("Código manual", placeholder="Ej: 066")
+    if manual:
+        row = find_product(df, manual)
+        if row is not None:
+            show_product(row)
+        else:
+            st.error("No encontré esa pieza.")
+        return
+    uploaded = st.file_uploader("Subir foto del QR", type=["jpg", "jpeg", "png"])
+    if uploaded:
+        file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        detector = cv2.QRCodeDetector()
+        data, bbox, _ = detector.detectAndDecode(img)
+        if data:
+            st.success(f"QR leído: {data}")
+            row = find_product(df, data)
+            if row is not None:
+                show_product(row)
             else:
-                st.warning("No pude leer el QR en esa foto. Acerca el teléfono, mejora la luz o busca por código numérico.")
+                st.error("El QR se leyó, pero no encontré la pieza.")
+        else:
+            st.error("No pude leer el QR. Escribe el código numérico manualmente.")
+
+
+def photos_page(df):
+    st.title("Fotos de productos")
+    if df.empty:
+        st.info("No hay inventario.")
+        return
+    q = st.text_input("Buscar pieza por código", placeholder="Ej: 066")
+    row = None
+    if q:
+        row = find_product(df, q)
+    else:
+        opts = [f"{normalize_numero(r.numero)} · {r.producto} · {r.color} · {display_talla(r.talla)}" for r in df.itertuples()]
+        selected = st.selectbox("O selecciona pieza", opts)
+        idx = opts.index(selected)
+        row = df.iloc[idx]
+    if row is None:
+        st.warning("No encontré esa pieza.")
+        return
+    show_product(row)
+    st.divider()
+    uploaded = st.file_uploader("Agregar / cambiar foto", type=["jpg", "jpeg", "png", "heic", "heif"])
+    if uploaded and st.button("Guardar foto", type="primary"):
+        try:
+            url = upload_product_photo(uploaded, row["numero"], row["producto"])
+            if not url:
+                st.error("Supabase no está configurado.")
+                return
+            df.loc[df["numero"].astype(str).apply(normalize_numero) == normalize_numero(row["numero"]), "foto_url"] = url
+            df["fecha_actualizacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ok, msg = save_inventory(df)
+            if ok:
+                st.success("Foto guardada correctamente.")
+                st.rerun()
+            else:
+                st.error(f"La foto subió, pero no pude guardar el link en Sheets: {msg}")
         except Exception as e:
-            st.error(f"No pude procesar el QR: {e}")
+            st.error(f"No pude guardar la foto: {e}")
 
 
-def buscar_page():
-    st.title("Buscar / escanear pieza")
-    q = st.text_input("Código numérico o interno", placeholder="Ej: 066")
-    # camera QR optional
-    if q:
-        idx, res = find_piece(q)
-        if idx is not None: show_piece(idx)
-        elif res.empty: st.error("No encontré esa pieza")
-        else:
-            st.dataframe(res[["numero","codigo_interno","producto","color","talla","precio","estado"]], use_container_width=True)
-
-
-def ventas_page():
-    st.title("Ventas / apartados")
-    if not can_sell(): st.warning("Sin permiso"); return
-    q = st.text_input("Código de pieza", placeholder="Ej: 066")
-    idx = None
-    if q:
-        idx, res = find_piece(q)
-        if idx is None:
-            if res.empty: st.error("No encontrada")
-            else: st.dataframe(res[["numero","codigo_interno","producto","estado"]], use_container_width=True)
-            return
-        show_piece(idx)
-    st.markdown("---")
-    st.subheader("Registrar movimiento")
-    clients = st.session_state.clientes.copy()
-    opts = [""] + [f"{r['cliente_id']} · {r['nombre']}" for _,r in clients.sort_values('nombre').iterrows()]
-    chosen = st.selectbox("Cliente", opts)
-    new_client = st.text_input("Nueva cliente (si no existe)")
-    tipo = st.radio("Tipo", ["venta", "apartado"], horizontal=True)
-    descuento_pct = st.number_input("Descuento %", min_value=0.0, max_value=100.0, value=0.0, step=1.0)
-    if st.button("Agregar a nota activa", type="primary", disabled=(idx is None)):
-        if idx is None:
-            st.error("Primero busca una pieza")
-            return
-        client_id = ""
-        if new_client.strip(): client_id = ensure_client(new_client.strip())
-        elif chosen: client_id = chosen.split(" · ")[0]
-        if not client_id:
-            st.error("Selecciona o crea una cliente")
-            return
-        inv = st.session_state.inventario; r = inv.loc[idx]
-        if clean(r['estado']) not in ["disponible", "apartado"]:
-            st.error(f"La pieza está en estado {r['estado']}")
-            return
-        nid = active_note_for_client(client_id)
-        price = fnum(r['precio']); disc = calc_discount_amount(price, descuento_pct); net = price-disc
-        line = {"linea_id": uuid.uuid4().hex, "nota_id": nid, "cliente_id": client_id, "fecha": now_str(), "tipo": tipo, "numero": num_code(r.get("numero")) or num_code(r.get("codigo_interno")), "codigo": clean(r['codigo']), "codigo_interno": clean(r['codigo_interno']), "producto": clean(r['producto']), "color": clean(r['color']), "talla": clean(r['talla']), "precio": price, "descuento_pct": descuento_pct, "descuento_monto": disc, "neto": net, "estado": "activo"}
-        st.session_state.ventas = pd.concat([st.session_state.ventas, pd.DataFrame([line])], ignore_index=True)
-        inv.at[idx, "estado"] = "vendido" if tipo=="venta" else "apartado"
-        inv.at[idx, "cliente_id"] = client_id; inv.at[idx, "nota_id"] = nid
-        if tipo == "venta": inv.at[idx,"fecha_venta"] = today_str()
-        else: inv.at[idx,"fecha_apartado"] = today_str()
-        inv.at[idx,"descuento_pct"] = descuento_pct; inv.at[idx,"fecha_actualizacion"] = now_str()
-        st.session_state.inventario = inv
-        save_sales(); save_inventory(); recalc_note(nid)
-        log(f"registrar_{tipo}", num_code(r.get("numero")) or num_code(r.get("codigo_interno")), f"Nota {nid} cliente {client_id}")
-        st.success(f"Agregado a nota {nid}")
-        st.rerun()
-
-
-def add_payment_widget(nota_id, client_id):
-    st.subheader("Agregar abono")
-    with st.form(f"payment_{nota_id}"):
-        monto = st.number_input("Monto", min_value=0.0, step=10.0)
-        metodo = st.selectbox("Método", PAYMENT_METHODS)
-        nota = st.text_input("Nota / referencia")
-        soporte = st.file_uploader("Foto / capture del pago", type=["jpg","jpeg","png","heic","heif"], key=f"soporte_{nota_id}")
-        submitted = st.form_submit_button("Registrar abono", type="primary")
-    if submitted:
-        if monto <= 0:
-            st.error("Monto inválido"); return
-        # duplicate guard: same note, monto, method in last 2 minutes
-        recent = st.session_state.pagos[(st.session_state.pagos["nota_id"].astype(str)==nota_id) & (st.session_state.pagos["monto"].astype(float)==float(monto)) & (st.session_state.pagos["metodo"].astype(str)==metodo)]
-        if not recent.empty:
-            last = clean(recent.iloc[-1]["fecha"])
-            st.warning(f"Ya existe un abono igual en esta nota ({last}). Revisa antes de registrar otra vez.")
-            return
-        url = ""
-        if soporte is not None:
-            try:
-                data, ct = compress_image(soporte)
-                path = f"pagos/{client_id}/pago_{nota_id}_{uuid.uuid4().hex[:8]}.jpg"
-                url, err = upload_to_supabase(data, path, ct)
-                if err: st.warning(f"No pude subir soporte: {err}")
-            except Exception as e: st.warning(f"No pude procesar soporte: {e}")
-        row = {"pago_id": uuid.uuid4().hex, "nota_id": nota_id, "cliente_id": client_id, "fecha": now_str(), "monto": monto, "metodo": metodo, "nota": nota, "soporte_url": url, "usuario": st.session_state.get("user","")}
-        st.session_state.pagos = pd.concat([st.session_state.pagos, pd.DataFrame([row])], ignore_index=True)
-        save_payments(); recalc_note(nota_id); log("abono", nota_id, f"{money(monto)} {metodo}")
-        st.success("Abono registrado")
-        st.rerun()
-
-
-def upload_note_pdf(nota_id):
-    pdf = create_note_pdf(nota_id)
-    notes = st.session_state.notas
-    note = notes[notes["nota_id"].astype(str)==nota_id].iloc[0]
-    cname = slug(clean(note["cliente_nombre"]) or get_client_name(note["cliente_id"]))
-    fname = f"nota_{nota_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-    path = f"notas/{cname}/{fname}"
-    url, err = upload_to_supabase(pdf, path, "application/pdf")
-    if not err:
-        idx = notes[notes["nota_id"].astype(str)==nota_id].index[0]
-        notes.at[idx,"pdf_url"] = url; notes.at[idx,"fecha_actualizacion"] = now_str()
-        st.session_state.notas = notes; save_notes()
-    return pdf, url, err
-
-
-def clientes_page():
-    st.title("Clientes")
-    if not can_sell(): st.warning("Sin permiso"); return
-    clients = st.session_state.clientes
-    if clients.empty: st.info("Aún no hay clientes")
-    with st.expander("Crear cliente"):
-        nombre = st.text_input("Nombre")
-        tel = st.text_input("Teléfono")
-        email = st.text_input("Email")
-        notas = st.text_area("Notas")
-        if st.button("Guardar cliente") and nombre.strip():
-            cid = ensure_client(nombre, tel, email, notas); st.success(f"Cliente {cid}"); st.rerun()
-    opts = [""] + [f"{r['cliente_id']} · {r['nombre']}" for _,r in clients.sort_values('nombre').iterrows()]
-    choice = st.selectbox("Cliente", opts)
-    if not choice: return
-    cid = choice.split(" · ")[0]
-    cname = get_client_name(cid)
-    st.subheader(f"{cid} · {cname}")
-    notes = st.session_state.notas[st.session_state.notas["cliente_id"].astype(str)==cid].copy()
-    if notes.empty:
-        st.info("No tiene notas")
-        if st.button("Crear nota activa"): active_note_for_client(cid); st.rerun()
-        return
-    st.dataframe(notes[["nota_id","fecha_creacion","estado","total_venta","total_apartado","pagado","saldo","pdf_url"]], use_container_width=True)
-    active = notes[notes["estado"]=="abierta"]
-    if active.empty:
-        if st.button("Crear nueva nota activa"): active_note_for_client(cid); st.rerun()
-        return
-    nid = clean(active.iloc[0]["nota_id"])
-    st.markdown(f"### Nota activa: {nid}")
-    lines = st.session_state.ventas[st.session_state.ventas["nota_id"].astype(str)==nid]
-    st.dataframe(lines[["fecha","tipo","numero","producto","talla","precio","descuento_pct","neto"]], use_container_width=True)
-    add_payment_widget(nid, cid)
-    st.markdown("---")
-    if st.button("Descargar nota PDF y guardar", type="primary"):
-        pdf, url, err = upload_note_pdf(nid)
-        if err: st.warning(f"PDF descargado, pero no se guardó en Supabase: {err}")
-        else: st.success("PDF guardado en Supabase")
-        st.download_button("Descargar PDF", data=pdf, file_name=f"nota_{nid}_{slug(cname)}.pdf", mime="application/pdf", use_container_width=True)
-
-
-def qr_page():
-    st.title("Generar etiquetas QR")
-    if not is_admin(): st.warning("Solo admin"); return
-    inv = st.session_state.inventario
-    if inv.empty: st.warning("Sin inventario"); return
-    scope = st.selectbox("Alcance", ["Disponibles", "Todo", "Apartadas"])
-    data = inv.copy()
-    if scope == "Disponibles": data = data[data.estado=="disponible"]
-    if scope == "Apartadas": data = data[data.estado=="apartado"]
-    st.write(f"Etiquetas: {len(data)}")
-    pdf = create_labels_pdf(data)
-    st.download_button("Descargar etiquetas PDF", data=pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
-
-
-def create_catalog_pdf(data, show_price=False, talla_filter=""):
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
-    from reportlab.lib.utils import ImageReader
-    import requests as _requests
-
-    bio = BytesIO(); c = canvas.Canvas(bio, pagesize=letter)
-    W, H = letter
-    margin = 0.55*inch
-    card_w = (W - 2*margin - 0.25*inch) / 2
-    card_h = 2.35*inch
-    gap_x = 0.25*inch; gap_y = 0.22*inch
-    y = H - margin - card_h
-    x_positions = [margin, margin + card_w + gap_x]
-
-    def header():
-        c.setFont("Helvetica-Bold", 18); c.drawString(margin, H-margin+0.05*inch, "CONCHERIE BOUTIQUE")
-        c.setFont("Helvetica", 9)
-        sub = "Catálogo disponible" + (f" · Talla {talla_filter}" if talla_filter else "")
-        c.drawString(margin, H-margin-0.15*inch, sub)
-    header()
-    col=0
-    for _, r in data.iterrows():
-        if y < margin:
-            c.showPage(); header(); y = H - margin - card_h; col = 0
-        x = x_positions[col]
-        c.setLineWidth(0.4); c.roundRect(x, y, card_w, card_h, 6, stroke=1, fill=0)
-        # image box
-        img_x, img_y, img_s = x+0.15*inch, y+0.35*inch, 1.55*inch
-        url = clean(r.get('foto_url'))
-        if url:
-            try:
-                resp = _requests.get(url, timeout=5)
-                if resp.status_code == 200:
-                    c.drawImage(ImageReader(BytesIO(resp.content)), img_x, img_y, img_s, img_s, preserveAspectRatio=True, mask='auto')
-                else:
-                    c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
-            except Exception:
-                c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
-        else:
-            c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
-        tx = x + 1.9*inch
-        c.setFont("Helvetica-Bold", 10); c.drawString(tx, y+1.85*inch, f"{num_code(r.get('numero')) or num_code(r.get('codigo_interno'))} · {clean(r.get('producto'))[:26]}")
-        c.setFont("Helvetica-Oblique", 8.5); c.drawString(tx, y+1.50*inch, f"{clean(r.get('color'))} · {display_talla(r.get('talla'))}")
-        # other available sizes by product/color
-        peers = data[(data['producto'].astype(str)==str(r.get('producto'))) & (data['color'].astype(str)==str(r.get('color')))]
-        tallas = sorted(set(display_talla(t) for t in peers['talla'].tolist()))
-        c.setFont("Helvetica", 7.2); c.drawString(tx, y+1.18*inch, f"Disponibles: {', '.join(tallas)[:34]}")
-        if show_price:
-            c.setFont("Helvetica-Bold", 14); c.drawString(tx, y+0.55*inch, money(r.get('precio')))
-        col += 1
-        if col >= 2:
-            col = 0; y -= card_h + gap_y
-    c.save(); bio.seek(0); return bio.getvalue()
-
-
-def catalogo_page():
+def catalog_page(df):
     st.title("Catálogo disponible")
-    inv = st.session_state.inventario
-    data = inv[inv.estado=="disponible"].copy()
-    if data.empty:
-        st.info("No hay disponibles"); return
-    show_price = st.checkbox("Incluir precio", value=False)
-    talla_filter = st.text_input("Filtrar por talla (opcional)", placeholder="Ej: T40")
-    if talla_filter:
-        data = data[data["talla"].astype(str).str.contains(talla_filter, case=False, na=False) | data["talla"].apply(display_talla).str.contains(talla_filter, case=False, na=False)]
-    data = data.copy()
-    data["numero_visible"] = data["numero"].apply(num_code)
-    st.write(f"Piezas en catálogo: **{len(data)}**")
-    pdf = create_catalog_pdf(data, show_price=show_price, talla_filter=talla_filter)
-    st.download_button("Descargar catálogo PDF", data=pdf, file_name="catalogo_concherie_disponible.pdf", mime="application/pdf", use_container_width=True)
-    st.dataframe(data[["numero_visible","producto","color","talla","precio"]], use_container_width=True)
-    with st.expander("Vista rápida en pantalla"):
-        for _, r in data.head(30).iterrows():
-            c1,c2 = st.columns([1,2])
-            with c1:
-                if clean(r.get('foto_url')): st.image(r['foto_url'], use_container_width=True)
-                else: st.info("Sin foto")
-            with c2:
-                st.markdown(f"**{num_code(r.get('numero'))} · {r['producto']}**")
-                st.caption(f"{r['color']} · {display_talla(r['talla'])}")
-                if show_price: st.markdown(f"### {money(r['precio'])}")
+    include_price = st.checkbox("Incluir precio", value=True)
+    talla_filter = st.text_input("Filtrar por talla opcional", placeholder="Ej: T40")
+    preview = df.copy()
+    if talla_filter.strip():
+        preview = preview[preview["talla"].astype(str).str.upper().str.contains(talla_filter.strip().upper(), na=False)]
+    st.dataframe(preview[["numero", "producto", "color", "talla", "precio", "foto_url"]], use_container_width=True)
+    pdf = build_catalog_pdf(df, include_price=include_price, talla_filter=talla_filter)
+    st.download_button("Descargar catálogo PDF", pdf, file_name="catalogo_concherie.pdf", mime="application/pdf", use_container_width=True)
 
 
-def carga_page():
-    st.title("Cargar recepción")
-    if not is_admin(): st.warning("Solo admin"); return
-    st.info("Excel esperado: marca/codigo/producto/cantidad/precio/llegaron/tallas. Se crean solo las piezas que llegaron.")
-    up = st.file_uploader("Excel", type=["xlsx"])
-    if not up: return
-    df = pd.read_excel(up)
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    st.dataframe(df.head(20), use_container_width=True)
-    if st.button("Generar inventario desde llegaron", type="primary"):
-        rows=[]
-        for _, r in df.iterrows():
-            codigo = clean(r.get("codigo") or r.get("código")); producto=clean(r.get("producto")); precio=fnum(r.get("precio")); llegaron=inum(r.get("llegaron"), inum(r.get("cantidad")))
-            if not codigo or not producto or llegaron<=0: continue
-            color = extract_color(producto)
-            tallas = extract_tallas_from_row(r, llegaron)
-            for i in range(llegaron):
-                numero = next_numeric_code_for_rows(rows)
-                talla = tallas[i] if i < len(tallas) else "T0"
-                interno = f"{codigo}-{color}-{display_talla(talla).replace('Talla Única','T0')}-{numero}"
-                rows.append({"numero": numero, "codigo": codigo, "codigo_interno": interno, "producto": producto, "color": color, "talla": talla, "precio": precio, "estado":"disponible", "cliente_id":"", "nota_id":"", "fecha_apartado":"", "fecha_venta":"", "descuento_pct":0.0, "foto_url":"", "notas":"", "fecha_actualizacion": now_str()})
-        st.session_state.inventario = pd.DataFrame(rows, columns=INVENTORY_COLUMNS)
-        save_inventory(); log("carga_recepcion", detalle=f"Piezas {len(rows)}")
-        st.success(f"Inventario cargado: {len(rows)} piezas"); st.rerun()
+def qr_page(df):
+    st.title("Generar QR / etiquetas")
+    st.caption("Formato 5x8 cm, QR grande, código numérico grande y líneas punteadas comunes para guillotina.")
+    pdf = build_labels_pdf(df)
+    st.download_button("Descargar etiquetas PDF", pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
 
 
-def next_numeric_code_for_rows(rows):
-    existing = [inum(x.get('numero')) for x in rows if clean(x.get('numero')).isdigit()]
-    inv = st.session_state.inventario
-    existing += [inum(x) for x in inv.get('numero', pd.Series(dtype=str)).astype(str) if clean(x).isdigit()]
-    return f"{(max(existing)+1 if existing else 1):03d}"
+def inventory_page(df):
+    st.title("Inventario")
+    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    if st.button("Guardar cambios", type="primary"):
+        ok, msg = save_inventory(edited)
+        if ok:
+            st.success("Inventario guardado.")
+        else:
+            st.error(msg)
 
 
-def extract_color(producto):
-    # last relevant color word from product text
-    colors = ["SILVER","PURPLE","VIOLETA","OLIVE","BLUE","ROJA","AMARILLA","ANIS","WHITE","LAVANDA","PINK","OLD PINK","FUCSIA","ORCHIDEA","ORO","GREEN","LEMON","SAND"]
-    p = clean(producto).upper()
-    for col in sorted(colors, key=len, reverse=True):
-        if col in p:
-            return col.replace("OLD ", "")
-    return "COLOR"
-
-
-def extract_tallas_from_row(r, llegaron):
-    vals=[]
-    for k,v in r.items():
-        if "talla" in str(k).lower() or str(k).lower().startswith("t"):
-            s=clean(v)
-            if s and s.lower() not in ["no", "nan"]:
-                parts = re.split(r"[,/;\s]+", s)
-                vals += [p if p.startswith("T") else f"T{p}" for p in parts if p]
-    vals = vals[:llegaron]
-    while len(vals)<llegaron: vals.append("T0")
-    return vals
-
-
-def reportes_page():
-    st.title("Reportes")
-    inv=st.session_state.inventario
-    st.dataframe(inv, use_container_width=True)
-    bio=BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        st.session_state.inventario.to_excel(writer, "inventario", index=False)
-        st.session_state.clientes.to_excel(writer, "clientes", index=False)
-        st.session_state.notas.to_excel(writer, "notas", index=False)
-        st.session_state.ventas.to_excel(writer, "ventas", index=False)
-        st.session_state.pagos.to_excel(writer, "pagos", index=False)
-        st.session_state.movimientos.to_excel(writer, "movimientos", index=False)
-    st.download_button("Descargar respaldo Excel", data=bio.getvalue(), file_name="respaldo_concherie.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-def admin_page():
-    st.title("Admin seguro")
-    if not is_admin(): st.warning("Solo admin"); return
-    q=st.text_input("Código numérico para anular/liberar", placeholder="066")
-    if q:
-        idx,res=find_piece(q)
-        if idx is not None:
-            show_piece(idx)
-            action=st.selectbox("Acción", ["Liberar/anular venta o apartado", "Eliminar pieza"])
-            conf=st.text_input("Confirma código numérico")
-            pwd=st.text_input("Clave admin", type="password")
-            if st.button("Ejecutar acción", type="primary"):
-                if num_code(conf)!=(num_code(st.session_state.inventario.loc[idx,'numero']) or num_code(st.session_state.inventario.loc[idx,'codigo_interno'])) or pwd!="master":
-                    st.error("Confirmación o clave incorrecta")
+def cargar_page(df):
+    st.title("Cargar inventario")
+    st.warning("Esto reemplaza el inventario actual. Usa solo si vas a recargar desde Excel.")
+    uploaded = st.file_uploader("Excel inventario", type=["xlsx", "xls"])
+    if uploaded:
+        new = pd.read_excel(uploaded)
+        new = ensure_inventory_schema(new)
+        st.dataframe(new, use_container_width=True)
+        confirm = st.text_input("Para reemplazar inventario escribe CARGAR")
+        if st.button("Guardar inventario", type="primary"):
+            if confirm == "CARGAR":
+                ok, msg = save_inventory(new)
+                if ok:
+                    st.success("Inventario cargado.")
+                    st.rerun()
                 else:
-                    inv=st.session_state.inventario; numero=num_code(inv.loc[idx,'numero']) or num_code(inv.loc[idx,'codigo_interno'])
-                    if action.startswith("Liberar"):
-                        inv.at[idx,"estado"]="disponible"; inv.at[idx,"cliente_id"]=""; inv.at[idx,"nota_id"]=""; inv.at[idx,"fecha_apartado"]=""; inv.at[idx,"fecha_venta"]=""; inv.at[idx,"descuento_pct"]=0.0
-                        st.session_state.ventas.loc[st.session_state.ventas["numero"].astype(str).str.zfill(3)==numero,"estado"]="anulada"
-                        save_sales()
+                    st.error(msg)
+            else:
+                st.error("Confirmación incorrecta.")
+
+
+def admin_page(df):
+    st.title("Admin")
+    st.subheader("Limpiar fotos")
+    q = st.text_input("Código de pieza", placeholder="Ej: 066")
+    if q:
+        row = find_product(df, q)
+        if row is not None:
+            show_product(row)
+            confirm = st.text_input("Para borrar la foto, escribe el código numérico")
+            pwd = st.text_input("Clave admin", type="password")
+            if st.button("Borrar foto", type="primary"):
+                if confirm == normalize_numero(row["numero"]) and pwd == USERS["jc"]["password"]:
+                    df.loc[df["numero"].astype(str).apply(normalize_numero) == normalize_numero(row["numero"]), "foto_url"] = ""
+                    ok, msg = save_inventory(df)
+                    if ok:
+                        st.success("Foto borrada.")
+                        st.rerun()
                     else:
-                        inv=inv.drop(index=idx).reset_index(drop=True)
-                    st.session_state.inventario=inv; save_inventory(); log("admin_accion", numero, action); st.success("Ejecutado"); st.rerun()
-        else: st.info("No hay coincidencia exacta")
+                        st.error(msg)
+                else:
+                    st.error("Confirmación o clave incorrecta.")
+        else:
+            st.error("No encontré esa pieza.")
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    load_all()
     if "user" not in st.session_state:
-        login_page(); return
+        login()
+        return
+    df = load_inventory()
     sidebar()
-    page=st.session_state.get("page","home")
-    if page=="home": home_page()
-    elif page=="escanear": escanear_page()
-    elif page=="buscar": buscar_page()
-    elif page=="ventas": ventas_page()
-    elif page=="clientes": clientes_page()
-    elif page=="qr": qr_page()
-    elif page=="catalogo": catalogo_page()
-    elif page=="carga": carga_page()
-    elif page=="reportes": reportes_page()
-    elif page=="admin": admin_page()
-    else: home_page()
+    page = st.session_state.get("page", "inicio")
+    if page == "inicio": home_page(df)
+    elif page == "buscar": search_page(df)
+    elif page == "scan": scan_page(df)
+    elif page == "fotos" and can_ventas(): photos_page(df)
+    elif page == "catalogo" and can_ventas(): catalog_page(df)
+    elif page == "qr" and can_admin(): qr_page(df)
+    elif page == "inventario" and can_admin(): inventory_page(df)
+    elif page == "cargar" and can_admin(): cargar_page(df)
+    elif page == "admin" and can_admin(): admin_page(df)
+    else:
+        st.warning("No tienes permiso para esta sección.")
 
 if __name__ == "__main__":
     main()
