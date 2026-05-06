@@ -156,6 +156,27 @@ def ensure_inventory(df):
     df["pagado"] = pd.to_numeric(df["pagado"], errors="coerce").fillna(0.0)
     for c in [c for c in INVENTORY_COLUMNS if c not in ["precio", "descuento_pct", "descuento", "pagado"]]:
         df[c] = df[c].fillna("").astype(str)
+
+    # Migración defensiva: si la hoja vieja no tiene columna `numero`
+    # o quedó vacía, se reconstruye desde el código interno.
+    # Ej: AC001-LAVANDA-066 -> 066
+    if "numero" in df.columns:
+        missing_num = df["numero"].astype(str).str.strip().isin(["", "nan", "None"])
+        inferred = df["codigo_interno"].astype(str).str.extract(r"(\d{3})\s*$")[0].fillna("")
+        df.loc[missing_num, "numero"] = inferred[missing_num]
+
+        def _format_numero(v):
+            v = clean_text(v)
+            if not v:
+                return ""
+            try:
+                # Mantiene 066, 001, etc. aunque venga como 66 o 66.0
+                return f"{int(float(v)):03d}"
+            except Exception:
+                return v
+
+        df["numero"] = df["numero"].apply(_format_numero)
+
     df.loc[df["estado"].str.strip() == "", "estado"] = "disponible"
     df.loc[df["ubicacion"].str.strip() == "", "ubicacion"] = "tienda"
     return df
@@ -1305,24 +1326,68 @@ def admin_page():
     st.error("Zona delicada: las acciones destructivas requieren respaldo, frase exacta y clave admin.")
     tab1,tab2=st.tabs(["Reversar/borrar pieza","Reset seguro"])
     with tab1:
-        df=st.session_state.inventario
-        if df.empty: st.info("No hay inventario."); return
-        idx=st.selectbox("Pieza", df.index, format_func=lambda i:f"{df.at[i,'numero']} · {df.at[i,'codigo_interno']} · {df.at[i,'estado']}")
+        df = ensure_inventory(st.session_state.inventario)
+        st.session_state.inventario = df
+        if df.empty:
+            st.info("No hay inventario.")
+            return
+
+        st.subheader("Buscar pieza por código")
+        search_num = st.text_input("Código numérico", placeholder="Ej: 066", key="admin_search_num")
+
+        view = df.copy()
+        if search_num.strip():
+            wanted = clean_text(search_num).zfill(3) if clean_text(search_num).isdigit() else clean_text(search_num)
+            view = df[df["numero"].astype(str).str.strip() == wanted]
+            if view.empty:
+                st.error(f"No encontré la pieza {wanted}.")
+                return
+
+        idx = st.selectbox(
+            "Pieza",
+            view.index,
+            format_func=lambda i: f"{df.at[i,'numero']} · {df.at[i,'codigo_interno']} · {df.at[i,'estado']}",
+        )
+
         show_piece(idx)
-        action=st.selectbox("Acción admin",["marcar disponible y limpiar venta","borrar pieza"])
-        confirm=st.text_input("Escribe el número de la pieza para confirmar")
-        pwd=st.text_input("Clave admin",type="password")
+
+        st.markdown("---")
+        action = st.selectbox("Acción admin", ["marcar disponible y limpiar venta", "borrar pieza"])
+        confirm = st.text_input("Escribe el número de la pieza para confirmar", placeholder=str(df.at[idx, "numero"]))
+        pwd = st.text_input("Clave admin", type="password")
+
         if st.button("Ejecutar acción", type="primary"):
-            if confirm != df.at[idx,"numero"] or pwd != USERS["jc"]["password"]:
+            expected = clean_text(df.at[idx, "numero"])
+            typed = clean_text(confirm).zfill(3) if clean_text(confirm).isdigit() else clean_text(confirm)
+
+            if typed != expected or pwd != USERS["jc"]["password"]:
                 st.error("Confirmación o clave incorrecta.")
             else:
-                numero=df.at[idx,"numero"]; ci=df.at[idx,"codigo_interno"]
+                numero = df.at[idx, "numero"]
+                ci = df.at[idx, "codigo_interno"]
+                old_cliente = clean_text(df.at[idx, "cliente"])
+
                 if action.startswith("marcar"):
-                    for c,v in {"estado":"disponible","cliente":"","descuento_pct":0,"descuento":0,"pagado":0,"ubicacion":"tienda"}.items(): df.at[idx,c]=v
-                    st.session_state.inventario=ensure_inventory(df); save_table("inventario"); log_event("admin_reversar", numero=numero, codigo_interno=ci)
+                    for c, v in {
+                        "estado": "disponible",
+                        "cliente": "",
+                        "descuento_pct": 0,
+                        "descuento": 0,
+                        "pagado": 0,
+                        "ubicacion": "tienda",
+                    }.items():
+                        df.at[idx, c] = v
+                    df.at[idx, "fecha_actualizacion"] = now_str()
+                    st.session_state.inventario = ensure_inventory(df)
+                    save_table("inventario")
+                    log_event("admin_reversar", numero=numero, codigo_interno=ci, cliente=old_cliente)
                 else:
-                    st.session_state.inventario=ensure_inventory(df.drop(index=idx).reset_index(drop=True)); save_table("inventario"); log_event("admin_borrar_pieza", numero=numero, codigo_interno=ci)
-                st.success("Hecho."); st.rerun()
+                    st.session_state.inventario = ensure_inventory(df.drop(index=idx).reset_index(drop=True))
+                    save_table("inventario")
+                    log_event("admin_borrar_pieza", numero=numero, codigo_interno=ci, cliente=old_cliente)
+
+                st.success("Hecho.")
+                st.rerun()
     with tab2:
         reportes_page()
         st.warning("Para resetear TODO escribe BORRAR TODO y clave admin.")
