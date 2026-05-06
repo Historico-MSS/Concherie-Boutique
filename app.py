@@ -88,6 +88,26 @@ def inum(x, default=0):
         return default
 
 
+def num_code(x):
+    """Always return the visible 3-digit code: 1, 1.0, 001 -> 001."""
+    s = clean(x)
+    if not s:
+        return ""
+    try:
+        return f"{int(float(s)):03d}"
+    except Exception:
+        m = re.search(r"(\d{1,3})(?:\.0)?$", s)
+        return f"{int(m.group(1)):03d}" if m else s
+
+
+def code_int(x):
+    try:
+        return int(float(clean(x)))
+    except Exception:
+        m = re.search(r"(\d{1,3})(?:\.0)?$", clean(x))
+        return int(m.group(1)) if m else 0
+
+
 def display_talla(t):
     t = clean(t)
     if not t or t in ["T0", "0", "TU", "ÚNICA", "UNICA"]:
@@ -275,7 +295,8 @@ def next_numeric_code():
     inv = st.session_state.inventario
     nums = []
     for v in inv.get("numero", pd.Series(dtype=str)).astype(str):
-        if v.strip().isdigit(): nums.append(int(v.strip()))
+        n = code_int(v)
+        if n: nums.append(n)
     n = max(nums) + 1 if nums else 1
     return f"{n:03d}"
 
@@ -369,10 +390,11 @@ def find_piece(query):
     inv = st.session_state.inventario
     if not q or inv.empty:
         return None, pd.DataFrame()
-    # first by numeric code
-    exact = inv[inv["numero"].astype(str).str.zfill(3) == q.zfill(3)] if q.isdigit() else pd.DataFrame()
-    if not exact.empty:
-        return exact.index[0], exact
+    qn = num_code(q)
+    if qn:
+        exact = inv[inv["numero"].apply(num_code) == qn]
+        if not exact.empty:
+            return exact.index[0], exact
     mask = inv.apply(lambda r: q.lower() in " ".join([str(v).lower() for v in r.values]), axis=1)
     res = inv[mask]
     if len(res) == 1:
@@ -428,11 +450,11 @@ def create_labels_pdf(data):
         col = pos % cols; row = pos // cols
         x0 = margin_x + col*label_w
         y0 = H - margin_y - (row+1)*label_h
-        qr = ImageReader(BytesIO(qr_png_bytes(str(r["numero"]).zfill(3))))
+        qr = ImageReader(BytesIO(qr_png_bytes(num_code(r.get("numero")) or num_code(r.get("codigo_interno")))))
         c.drawImage(qr, x0+0.35*cm, y0+0.5*cm, qr_size, qr_size, preserveAspectRatio=True, mask='auto')
         tx = x0 + 4.7*cm
         c.setFont("Helvetica-Bold", 27)
-        c.drawString(tx, y0 + 3.75*cm, str(r["numero"]).zfill(3))
+        c.drawString(tx, y0 + 3.75*cm, num_code(r.get("numero")) or num_code(r.get("codigo_interno")))
         c.setFont("Helvetica-Bold", 8.5)
         c.drawString(tx, y0 + 3.20*cm, clean(r["producto"])[:24])
         c.setFont("Helvetica", 8.5)
@@ -476,7 +498,7 @@ def create_note_pdf(nota_id, disclaimer=True):
             if y < 1.2*inch:
                 c.showPage(); y = H - 0.7*inch
             c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(0.8*inch, y, f"{clean(r['numero']).zfill(3)} · {clean(r['producto'])[:42]}")
+            c.drawString(0.8*inch, y, f"{num_code(r['numero'])} · {clean(r['producto'])[:42]}")
             c.setFont("Helvetica", 8.5)
             c.drawRightString(7.5*inch, y, money(r['neto']))
             y -= 0.18*inch
@@ -530,7 +552,7 @@ def sidebar():
     st.sidebar.success("Archivos: Supabase" if supabase_configured() else "Archivos: no configurado")
     if st.session_state.get("storage_warning"):
         st.sidebar.info(st.session_state.storage_warning)
-    buttons = [("🏠 Inicio","home"),("🔎 Buscar código","buscar")]
+    buttons = [("🏠 Inicio","home"),("■ Escanear QR","escanear"),("🔎 Buscar código","buscar")]
     if can_sell(): buttons += [("🛍️ Ventas","ventas"),("👥 Clientes","clientes"),("📄 Catálogo","catalogo")]
     if is_admin(): buttons += [("📥 Cargar recepción","carga"),("🏷️ Generar QR","qr"),("📊 Reportes","reportes"),("⚙️ Admin","admin")]
     for label, pg in buttons:
@@ -543,10 +565,12 @@ def sidebar():
 def home_page():
     r = role(); st.title("Concherie Boutique")
     if r == "info":
-        st.button("🔎 Buscar / escanear código", use_container_width=True, on_click=lambda: set_page("buscar"))
+        st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
+        st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
     elif r == "ventas":
         c1,c2 = st.columns(2)
         with c1:
+            st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
             st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
             st.button("🛍️ Registrar venta/apartado", use_container_width=True, on_click=lambda: set_page("ventas"))
         with c2:
@@ -555,6 +579,7 @@ def home_page():
     else:
         c1,c2,c3 = st.columns(3)
         with c1:
+            st.button("■ Escanear QR", use_container_width=True, on_click=lambda: set_page("escanear"))
             st.button("🔎 Buscar código", use_container_width=True, on_click=lambda: set_page("buscar"))
             st.button("📥 Cargar recepción", use_container_width=True, on_click=lambda: set_page("carga"))
         with c2:
@@ -574,6 +599,7 @@ def home_page():
 def show_piece(idx):
     inv = st.session_state.inventario
     r = inv.loc[idx]
+    visible_num = num_code(r.get("numero")) or num_code(r.get("codigo_interno"))
     col1,col2 = st.columns([1,2])
     with col1:
         url = clean(r.get("foto_url"))
@@ -584,7 +610,7 @@ def show_piece(idx):
             if up and st.button("Guardar foto", key=f"savephoto_{idx}"):
                 try:
                     data, ct = compress_image(up)
-                    path = f"fotos/piezas/{clean(r['numero']).zfill(3)}_{uuid.uuid4().hex[:8]}.jpg"
+                    path = f"fotos/piezas/{visible_num}_{uuid.uuid4().hex[:8]}.jpg"
                     url, err = upload_to_supabase(data, path, ct)
                     if err:
                         st.error(err)
@@ -592,7 +618,7 @@ def show_piece(idx):
                         inv.at[idx,"foto_url"] = url; inv.at[idx,"fecha_actualizacion"] = now_str(); save_inventory(); st.success("Foto guardada"); st.rerun()
                 except Exception as e: st.error(f"No pude procesar la foto: {e}")
     with col2:
-        st.subheader(f"{clean(r['numero']).zfill(3)} · {r['producto']}")
+        st.subheader(f"{visible_num} · {r['producto']}")
         st.write(f"**Código interno:** {r['codigo_interno']}")
         st.write(f"**Color:** {r['color']}")
         st.write(f"**Talla:** {display_talla(r['talla'])}")
@@ -609,6 +635,31 @@ def show_piece(idx):
                     st.write(f"**Días apartada:** {days}")
                     if days > 10: st.warning("Apartado con más de 10 días")
                 except Exception: pass
+
+
+def escanear_page():
+    st.title("Escanear QR")
+    st.info("Usa la cámara para tomar la foto del QR. Si no lo lee, escribe el código numérico en Buscar código.")
+    img_file = st.camera_input("Cámara QR")
+    if img_file is not None:
+        try:
+            import cv2
+            import numpy as np
+            img = Image.open(img_file).convert("RGB")
+            arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            detector = cv2.QRCodeDetector()
+            data, bbox, _ = detector.detectAndDecode(arr)
+            if data:
+                st.success(f"Código leído: {data}")
+                idx, res = find_piece(data)
+                if idx is not None:
+                    show_piece(idx)
+                else:
+                    st.error("Leí el QR, pero no encontré la pieza en inventario.")
+            else:
+                st.warning("No pude leer el QR en esa foto. Acerca el teléfono, mejora la luz o busca por código numérico.")
+        except Exception as e:
+            st.error(f"No pude procesar el QR: {e}")
 
 
 def buscar_page():
@@ -659,7 +710,7 @@ def ventas_page():
             return
         nid = active_note_for_client(client_id)
         price = fnum(r['precio']); disc = calc_discount_amount(price, descuento_pct); net = price-disc
-        line = {"linea_id": uuid.uuid4().hex, "nota_id": nid, "cliente_id": client_id, "fecha": now_str(), "tipo": tipo, "numero": clean(r['numero']).zfill(3), "codigo": clean(r['codigo']), "codigo_interno": clean(r['codigo_interno']), "producto": clean(r['producto']), "color": clean(r['color']), "talla": clean(r['talla']), "precio": price, "descuento_pct": descuento_pct, "descuento_monto": disc, "neto": net, "estado": "activo"}
+        line = {"linea_id": uuid.uuid4().hex, "nota_id": nid, "cliente_id": client_id, "fecha": now_str(), "tipo": tipo, "numero": num_code(r.get("numero")) or num_code(r.get("codigo_interno")), "codigo": clean(r['codigo']), "codigo_interno": clean(r['codigo_interno']), "producto": clean(r['producto']), "color": clean(r['color']), "talla": clean(r['talla']), "precio": price, "descuento_pct": descuento_pct, "descuento_monto": disc, "neto": net, "estado": "activo"}
         st.session_state.ventas = pd.concat([st.session_state.ventas, pd.DataFrame([line])], ignore_index=True)
         inv.at[idx, "estado"] = "vendido" if tipo=="venta" else "apartado"
         inv.at[idx, "cliente_id"] = client_id; inv.at[idx, "nota_id"] = nid
@@ -668,7 +719,7 @@ def ventas_page():
         inv.at[idx,"descuento_pct"] = descuento_pct; inv.at[idx,"fecha_actualizacion"] = now_str()
         st.session_state.inventario = inv
         save_sales(); save_inventory(); recalc_note(nid)
-        log(f"registrar_{tipo}", clean(r['numero']).zfill(3), f"Nota {nid} cliente {client_id}")
+        log(f"registrar_{tipo}", num_code(r.get("numero")) or num_code(r.get("codigo_interno")), f"Nota {nid} cliente {client_id}")
         st.success(f"Agregado a nota {nid}")
         st.rerun()
 
@@ -775,24 +826,89 @@ def qr_page():
     st.download_button("Descargar etiquetas PDF", data=pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
 
 
+def create_catalog_pdf(data, show_price=False, talla_filter=""):
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.units import inch
+    from reportlab.lib.utils import ImageReader
+    import requests as _requests
+
+    bio = BytesIO(); c = canvas.Canvas(bio, pagesize=letter)
+    W, H = letter
+    margin = 0.55*inch
+    card_w = (W - 2*margin - 0.25*inch) / 2
+    card_h = 2.35*inch
+    gap_x = 0.25*inch; gap_y = 0.22*inch
+    y = H - margin - card_h
+    x_positions = [margin, margin + card_w + gap_x]
+
+    def header():
+        c.setFont("Helvetica-Bold", 18); c.drawString(margin, H-margin+0.05*inch, "CONCHERIE BOUTIQUE")
+        c.setFont("Helvetica", 9)
+        sub = "Catálogo disponible" + (f" · Talla {talla_filter}" if talla_filter else "")
+        c.drawString(margin, H-margin-0.15*inch, sub)
+    header()
+    col=0
+    for _, r in data.iterrows():
+        if y < margin:
+            c.showPage(); header(); y = H - margin - card_h; col = 0
+        x = x_positions[col]
+        c.setLineWidth(0.4); c.roundRect(x, y, card_w, card_h, 6, stroke=1, fill=0)
+        # image box
+        img_x, img_y, img_s = x+0.15*inch, y+0.35*inch, 1.55*inch
+        url = clean(r.get('foto_url'))
+        if url:
+            try:
+                resp = _requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    c.drawImage(ImageReader(BytesIO(resp.content)), img_x, img_y, img_s, img_s, preserveAspectRatio=True, mask='auto')
+                else:
+                    c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
+            except Exception:
+                c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
+        else:
+            c.setFont("Helvetica",8); c.drawCentredString(img_x+img_s/2, img_y+img_s/2, "Sin foto")
+        tx = x + 1.9*inch
+        c.setFont("Helvetica-Bold", 10); c.drawString(tx, y+1.85*inch, f"{num_code(r.get('numero')) or num_code(r.get('codigo_interno'))} · {clean(r.get('producto'))[:26]}")
+        c.setFont("Helvetica-Oblique", 8.5); c.drawString(tx, y+1.50*inch, f"{clean(r.get('color'))} · {display_talla(r.get('talla'))}")
+        # other available sizes by product/color
+        peers = data[(data['producto'].astype(str)==str(r.get('producto'))) & (data['color'].astype(str)==str(r.get('color')))]
+        tallas = sorted(set(display_talla(t) for t in peers['talla'].tolist()))
+        c.setFont("Helvetica", 7.2); c.drawString(tx, y+1.18*inch, f"Disponibles: {', '.join(tallas)[:34]}")
+        if show_price:
+            c.setFont("Helvetica-Bold", 14); c.drawString(tx, y+0.55*inch, money(r.get('precio')))
+        col += 1
+        if col >= 2:
+            col = 0; y -= card_h + gap_y
+    c.save(); bio.seek(0); return bio.getvalue()
+
+
 def catalogo_page():
     st.title("Catálogo disponible")
     inv = st.session_state.inventario
     data = inv[inv.estado=="disponible"].copy()
-    if data.empty: st.info("No hay disponibles"); return
+    if data.empty:
+        st.info("No hay disponibles"); return
     show_price = st.checkbox("Incluir precio", value=False)
     talla_filter = st.text_input("Filtrar por talla (opcional)", placeholder="Ej: T40")
-    if talla_filter: data = data[data["talla"].astype(str).str.contains(talla_filter, case=False, na=False)]
-    st.dataframe(data[["numero","producto","color","talla","precio","foto_url"]], use_container_width=True)
-    # simple elegant HTML-ish gallery in app
-    for _, r in data.head(80).iterrows():
-        c1,c2 = st.columns([1,2])
-        with c1:
-            if clean(r['foto_url']): st.image(r['foto_url'], use_container_width=True)
-        with c2:
-            st.markdown(f"**{r['numero']} · {r['producto']}**")
-            st.caption(f"{r['color']} · {display_talla(r['talla'])}")
-            if show_price: st.markdown(f"### {money(r['precio'])}")
+    if talla_filter:
+        data = data[data["talla"].astype(str).str.contains(talla_filter, case=False, na=False) | data["talla"].apply(display_talla).str.contains(talla_filter, case=False, na=False)]
+    data = data.copy()
+    data["numero_visible"] = data["numero"].apply(num_code)
+    st.write(f"Piezas en catálogo: **{len(data)}**")
+    pdf = create_catalog_pdf(data, show_price=show_price, talla_filter=talla_filter)
+    st.download_button("Descargar catálogo PDF", data=pdf, file_name="catalogo_concherie_disponible.pdf", mime="application/pdf", use_container_width=True)
+    st.dataframe(data[["numero_visible","producto","color","talla","precio"]], use_container_width=True)
+    with st.expander("Vista rápida en pantalla"):
+        for _, r in data.head(30).iterrows():
+            c1,c2 = st.columns([1,2])
+            with c1:
+                if clean(r.get('foto_url')): st.image(r['foto_url'], use_container_width=True)
+                else: st.info("Sin foto")
+            with c2:
+                st.markdown(f"**{num_code(r.get('numero'))} · {r['producto']}**")
+                st.caption(f"{r['color']} · {display_talla(r['talla'])}")
+                if show_price: st.markdown(f"### {money(r['precio'])}")
 
 
 def carga_page():
@@ -878,10 +994,10 @@ def admin_page():
             conf=st.text_input("Confirma código numérico")
             pwd=st.text_input("Clave admin", type="password")
             if st.button("Ejecutar acción", type="primary"):
-                if conf.zfill(3)!=clean(st.session_state.inventario.loc[idx,'numero']).zfill(3) or pwd!="master":
+                if num_code(conf)!=(num_code(st.session_state.inventario.loc[idx,'numero']) or num_code(st.session_state.inventario.loc[idx,'codigo_interno'])) or pwd!="master":
                     st.error("Confirmación o clave incorrecta")
                 else:
-                    inv=st.session_state.inventario; numero=clean(inv.loc[idx,'numero']).zfill(3)
+                    inv=st.session_state.inventario; numero=num_code(inv.loc[idx,'numero']) or num_code(inv.loc[idx,'codigo_interno'])
                     if action.startswith("Liberar"):
                         inv.at[idx,"estado"]="disponible"; inv.at[idx,"cliente_id"]=""; inv.at[idx,"nota_id"]=""; inv.at[idx,"fecha_apartado"]=""; inv.at[idx,"fecha_venta"]=""; inv.at[idx,"descuento_pct"]=0.0
                         st.session_state.ventas.loc[st.session_state.ventas["numero"].astype(str).str.zfill(3)==numero,"estado"]="anulada"
@@ -901,6 +1017,7 @@ def main():
     sidebar()
     page=st.session_state.get("page","home")
     if page=="home": home_page()
+    elif page=="escanear": escanear_page()
     elif page=="buscar": buscar_page()
     elif page=="ventas": ventas_page()
     elif page=="clientes": clientes_page()
