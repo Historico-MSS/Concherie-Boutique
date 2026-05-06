@@ -1,22 +1,18 @@
-# Concherie Boutique App
+# Concherie Boutique App v4
 
 ## Usuarios
-- jc / master
-- ventas / moira
-- info / precio
+- `jc` / `master`: administrador
+- `ventas` / `moira`: operación de tienda
+- `info` / `precio`: consulta rápida
 
-## Persistencia
-- Google Sheets: inventario, clientes, movimientos, notas, pagos.
-- Supabase Storage: fotos, notas PDF, soportes de pago.
+## Backend
+- Google Sheets: datos (`inventario`, `clientes`, `notas`, `ventas`, `pagos`, `movimientos`)
+- Supabase Storage: fotos, soportes de pagos y notas PDF
 
-## Secrets necesarios
-- [connections.gsheets]
-- [supabase]
+## Streamlit Secrets necesarios
+Ya deben existir:
+- `[connections.gsheets]`
+- `[supabase]`
 
-## Hojas Google Sheets
-Crea estas pestañas:
-- inventario
-- clientes
-- movimientos
-- notas
-- pagos
+## Importante
+Crear pestañas en Google Sheets: `inventario`, `clientes`, `notas`, `ventas`, `pagos`, `movimientos`.
