@@ -368,10 +368,11 @@ def drive_find_child(parent_id, name, mime_type=None):
     if not drive_ready():
         return ""
     _, _, drive = google_creds_and_services()
-    q = f"'{parent_id}' in parents and name = '{name.replace(chr(39), chr(92)+chr(39))}' and trashed = false"
+    safe_name = name.replace("'", "\'")
+    q = f"'{parent_id}' in parents and name = '{safe_name}' and trashed = false"
     if mime_type:
         q += f" and mimeType = '{mime_type}'"
-    res = drive.files().list(q=q, fields="files(id,name,mimeType)").execute()
+    res = drive.files().list(q=q, fields="files(id,name,mimeType)", supportsAllDrives=True).execute()
     files = res.get("files", [])
     return files[0]["id"] if files else ""
 
@@ -382,7 +383,7 @@ def drive_create_folder(parent_id, name):
         return existing
     _, _, drive = google_creds_and_services()
     metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent_id]}
-    file = drive.files().create(body=metadata, fields="id").execute()
+    file = drive.files().create(body=metadata, fields="id", supportsAllDrives=True).execute(num_retries=3)
     return file["id"]
 
 
@@ -392,7 +393,12 @@ def drive_upload_bytes(data, filename, mime_type, parent_id):
     _, _, drive = google_creds_and_services()
     media = MediaIoBaseUpload(BytesIO(data), mimetype=mime_type, resumable=False)
     metadata = {"name": filename, "parents": [parent_id]}
-    file = drive.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
+    file = drive.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id, webViewLink",
+        supportsAllDrives=True,
+    ).execute(num_retries=3)
     return file.get("id", ""), file.get("webViewLink", "")
 
 
@@ -449,6 +455,36 @@ def upload_note_to_drive(cliente, pdf_bytes, total, saldo):
     st.session_state.notas = pd.concat([st.session_state.notas, pd.DataFrame([row])], ignore_index=True)
     save_table("notas")
     return file_id, url
+
+
+def save_note_to_drive_safe(cliente, pdf_bytes, total, pagado, saldo):
+    """Guarda la nota en Drive sin romper la pantalla si Drive falla."""
+    key = f"nota_guardada_{safe_filename(cliente)}_{len(pdf_bytes)}_{safe_float(total):.2f}_{safe_float(saldo):.2f}"
+    if st.session_state.get(key):
+        return st.session_state[key]
+    try:
+        notes_root = get_root_subfolder("Notas de venta")
+        client_folder = drive_create_folder(notes_root, safe_filename(cliente))
+        filename = f"Nota_{safe_filename(cliente)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        file_id, url = drive_upload_bytes(pdf_bytes, filename, "application/pdf", client_folder)
+        row = {
+            "fecha": now_str(),
+            "cliente": cliente,
+            "nota": filename,
+            "total": str(total),
+            "pagado": str(pagado),
+            "saldo": str(saldo),
+            "drive_file_id": file_id,
+            "drive_url": url,
+        }
+        st.session_state.notas = pd.concat([st.session_state.notas, pd.DataFrame([row])], ignore_index=True)
+        save_table("notas")
+        st.session_state[key] = (file_id, url, "ok")
+        st.session_state["last_note_drive_status"] = f"Nota guardada en Drive: {url or file_id}"
+        return st.session_state[key]
+    except Exception as e:
+        st.session_state["last_note_drive_status"] = f"No pude guardar en Drive. Se descargó el PDF, pero revisa permiso de carpeta. Detalle: {e}"
+        return "", "", "error"
 
 # ============================================================
 # CODES / PARSING
@@ -763,6 +799,31 @@ def show_piece(idx):
         st.markdown("---")
         quick_action_form(idx)
 
+    if is_admin() and clean_text(r.get("estado")) in ["vendido", "reservado", "probando"]:
+        st.markdown("---")
+        st.subheader("Anular venta / reserva")
+        with st.form(f"anular_{idx}"):
+            st.warning("Esto devuelve la pieza a disponible y limpia cliente, descuento y pago.")
+            confirm = st.text_input("Escribe el código numérico para confirmar", placeholder=str(r["numero"]))
+            pwd = st.text_input("Clave admin", type="password")
+            ok = st.form_submit_button("Anular venta / reserva", use_container_width=True)
+        if ok:
+            if confirm.strip() != str(r["numero"]) or pwd != USERS["jc"]["password"]:
+                st.error("Confirmación o clave incorrecta.")
+            else:
+                df.at[idx,"estado"] = "disponible"
+                df.at[idx,"cliente"] = ""
+                df.at[idx,"descuento_pct"] = 0
+                df.at[idx,"descuento"] = 0
+                df.at[idx,"pagado"] = 0
+                df.at[idx,"ubicacion"] = "tienda"
+                df.at[idx,"fecha_actualizacion"] = now_str()
+                st.session_state.inventario = ensure_inventory(df)
+                save_table("inventario")
+                log_event("anular_venta", numero=r.numero, codigo_interno=r.codigo_interno, cliente=clean_text(r.cliente), detalle="Anulada desde ficha admin")
+                st.success("Venta/reserva anulada.")
+                st.rerun()
+
 
 def show_piece_photo(row):
     data = drive_download_bytes(clean_text(row.get("foto_file_id", "")))
@@ -949,14 +1010,24 @@ def show_client(cliente):
     total = data.neto.sum(); pagado = data.pagado.sum(); saldo = data.saldo.sum()
     c1,c2,c3 = st.columns(3); c1.metric("Total", money(total)); c2.metric("Pagado", money(pagado)); c3.metric("Saldo", money(saldo))
     pdf = create_invoice_pdf(cliente, data)
-    col1,col2 = st.columns(2)
-    with col1:
-        st.download_button("Descargar nota PDF", data=pdf, file_name=f"nota_{safe_filename(cliente)}.pdf", mime="application/pdf", use_container_width=True)
-    with col2:
-        if st.button("Guardar nota en Drive", use_container_width=True):
-            fid,url = upload_note_to_drive(cliente, pdf, total, saldo)
-            st.success("Nota guardada en Drive.")
-            st.write(url)
+
+    def _guardar_nota_drive():
+        save_note_to_drive_safe(cliente, pdf, total, pagado, saldo)
+
+    st.download_button(
+        "Descargar nota PDF y guardar en Drive",
+        data=pdf,
+        file_name=f"nota_{safe_filename(cliente)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+        on_click=_guardar_nota_drive,
+    )
+    status = st.session_state.get("last_note_drive_status", "")
+    if status:
+        if status.startswith("Nota guardada"):
+            st.success(status)
+        else:
+            st.warning(status)
 
 # ============================================================
 # PDF / QR
@@ -980,26 +1051,98 @@ def qr_page():
     st.download_button("Descargar etiquetas 5x8 cm", data=pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
 
 
-def create_qr_labels_pdf(df):
-    buf=BytesIO(); c=canvas.Canvas(buf, pagesize=letter)
-    width,height=letter
-    label_w=8*cm; label_h=5*cm; margin_x=.5*cm; margin_y=.5*cm; gap=.25*cm
-    cols=max(1,int((width-2*margin_x)//(label_w+gap))); rows=max(1,int((height-2*margin_y)//(label_h+gap)))
-    for n,(_,r) in enumerate(df.iterrows()):
-        if n>0 and n%(cols*rows)==0: c.showPage()
-        col=n%cols; row=(n//cols)%rows
-        x=margin_x+col*(label_w+gap); y=height-margin_y-(row+1)*label_h-row*gap
-        c.roundRect(x,y,label_w,label_h,6,stroke=1,fill=0)
-        qr_size=4*cm
-        c.drawImage(ImageReader(BytesIO(qr_png(r.numero))), x+.35*cm, y+.5*cm, qr_size, qr_size, mask="auto")
-        tx=x+4.75*cm
-        c.setFont("Helvetica-Bold",26); c.drawString(tx,y+3.55*cm,str(r.numero))
-        c.setFont("Helvetica-Bold",10); c.drawString(tx,y+2.75*cm,clean_text(r.codigo)[:18])
-        c.setFont("Helvetica",9); c.drawString(tx,y+2.25*cm,clean_text(r.color)[:20])
-        c.setFont("Helvetica",9); c.drawString(tx,y+1.75*cm,display_talla(r.talla)[:20])
-        c.setFont("Helvetica-Oblique",7); c.drawString(tx,y+.65*cm,clean_text(r.codigo_interno)[:24])
-    c.save(); buf.seek(0); return buf.getvalue()
+def _wrap_pdf_text(c, text, max_width, font_name, font_size, max_lines=2):
+    words = clean_text(text).split()
+    lines = []
+    current = ""
+    for word in words:
+        test = (current + " " + word).strip()
+        if c.stringWidth(test, font_name, font_size) <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+        if len(lines) >= max_lines:
+            break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    if len(lines) == max_lines and len(" ".join(words)) > len(" ".join(lines)):
+        if len(lines[-1]) > 3:
+            lines[-1] = lines[-1][:-3] + "..."
+    return lines
 
+
+def create_qr_labels_pdf(df):
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+
+    label_w = 8 * cm
+    label_h = 5 * cm
+    margin_x = 0.45 * cm
+    margin_y = 0.45 * cm
+    gap_x = 0.25 * cm
+    gap_y = 0.25 * cm
+    qr_size = 4 * cm
+
+    cols = max(1, int((width - 2 * margin_x + gap_x) // (label_w + gap_x)))
+    rows = max(1, int((height - 2 * margin_y + gap_y) // (label_h + gap_y)))
+
+    ordered = df.copy().sort_values(["codigo_interno", "numero"])
+
+    for n, (_, r) in enumerate(ordered.iterrows()):
+        if n > 0 and n % (cols * rows) == 0:
+            c.showPage()
+
+        col = n % cols
+        row = (n // cols) % rows
+        x = margin_x + col * (label_w + gap_x)
+        y = height - margin_y - (row + 1) * label_h - row * gap_y
+
+        # Línea punteada de corte para guillotina / imprenta
+        c.setDash(2, 2)
+        c.setLineWidth(0.45)
+        c.rect(x, y, label_w, label_h, stroke=1, fill=0)
+        c.setDash()
+
+        # QR 4x4 cm
+        c.drawImage(
+            ImageReader(BytesIO(qr_png(r.numero))),
+            x + 0.35 * cm,
+            y + 0.50 * cm,
+            qr_size,
+            qr_size,
+            mask="auto",
+        )
+
+        tx = x + 4.75 * cm
+        right_w = label_w - 5.0 * cm
+
+        # Código numérico grande
+        c.setFont("Helvetica-Bold", 26)
+        c.drawString(tx, y + 3.78 * cm, str(r.numero))
+
+        # Nombre de la pieza
+        c.setFont("Helvetica-Bold", 8.4)
+        product_lines = _wrap_pdf_text(c, clean_text(r.producto), right_w, "Helvetica-Bold", 8.4, max_lines=2)
+        yy = y + 3.22 * cm
+        for line in product_lines:
+            c.drawString(tx, yy, line)
+            yy -= 0.33 * cm
+
+        # Color y talla
+        c.setFont("Helvetica", 8.2)
+        c.drawString(tx, y + 2.25 * cm, clean_text(r.color)[:22])
+        c.drawString(tx, y + 1.82 * cm, display_talla(r.talla)[:22])
+
+        # Código interno pequeño
+        c.setFont("Helvetica-Oblique", 6.6)
+        c.drawString(tx, y + 0.55 * cm, clean_text(r.codigo_interno)[:30])
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
 
 def catalogo_page():
     st.title("Catálogo")
@@ -1045,27 +1188,100 @@ def create_catalog_pdf(df, con_precio=True):
 
 
 def create_invoice_pdf(cliente, data):
-    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=letter); width,height=letter; y=height-.75*inch
-    c.setFont("Helvetica-Bold",20); c.drawString(.7*inch,y,"Concherie Boutique"); y-=.28*inch
-    c.setFont("Helvetica-Oblique",12); c.drawString(.7*inch,y,"Nota de venta"); y-=.25*inch
-    c.setFont("Helvetica",10); c.drawString(.7*inch,y,f"Cliente: {cliente}"); y-=.2*inch; c.drawString(.7*inch,y,f"Fecha: {today_str()}"); y-=.45*inch
-    headers=["Código","Producto","Talla","Precio","Desc%","Neto","Pagado","Saldo"]; xs=[.45,1.1,2.85,3.45,4.15,4.8,5.55,6.35]
-    c.setFont("Helvetica-Bold",8)
-    for x,h in zip(xs,headers): c.drawString(x*inch,y,h)
-    y-=.17*inch; c.line(.45*inch,y,7.3*inch,y); y-=.2*inch
-    c.setFont("Helvetica",7.5)
-    total=pagado=saldo=0
-    for _,r in data.iterrows():
-        if y<.8*inch: c.showPage(); y=height-.7*inch; c.setFont("Helvetica",7.5)
-        precio=safe_float(r.precio); desc=safe_float(r.descuento); neto=precio-desc; pay=safe_float(r.pagado); sal=neto-pay
-        total+=neto; pagado+=pay; saldo+=sal
-        vals=[r.numero, clean_text(r.producto)[:24], display_talla(r.talla)[:8], money(precio), f"{safe_float(r.descuento_pct):.0f}%", money(neto), money(pay), money(sal)]
-        for x,v in zip(xs,vals): c.drawString(x*inch,y,str(v))
-        y-=.18*inch
-    y-=.3*inch
-    c.setFont("Helvetica-Bold",11); c.drawString(.7*inch,y,f"Total: {money(total)}"); y-=.23*inch; c.drawString(.7*inch,y,f"Pagado: {money(pagado)}"); y-=.23*inch
-    c.setFont("Helvetica-Bold",14); c.drawString(.7*inch,y,f"Saldo pendiente: {money(saldo)}")
-    c.save(); buf.seek(0); return buf.getvalue()
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+
+    margin = 0.72 * inch
+    y = height - margin
+
+    c.setFont("Helvetica-Bold", 20)
+    c.drawString(margin, y, "CONCHERIE BOUTIQUE")
+    y -= 0.28 * inch
+    c.setFont("Helvetica-Oblique", 12)
+    c.drawString(margin, y, "Nota de venta")
+    y -= 0.34 * inch
+
+    c.setFont("Helvetica", 9.5)
+    c.drawString(margin, y, f"Cliente: {cliente}")
+    c.drawRightString(width - margin, y, f"Fecha: {today_str()}")
+    y -= 0.35 * inch
+
+    c.setLineWidth(0.7)
+    c.line(margin, y, width - margin, y)
+    y -= 0.28 * inch
+
+    total = 0
+    pagado_total = 0
+    saldo_total = 0
+
+    for _, r in data.iterrows():
+        if y < 1.8 * inch:
+            c.showPage()
+            y = height - margin
+
+        precio = safe_float(r.precio)
+        desc_pct = safe_float(r.descuento_pct)
+        desc = safe_float(r.descuento)
+        neto = precio - desc
+        pay = safe_float(r.pagado)
+        sal = neto - pay
+        total += neto
+        pagado_total += pay
+        saldo_total += sal
+
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, f"{r.numero}  ·  {clean_text(r.producto)[:42]}")
+        y -= 0.20 * inch
+        c.setFont("Helvetica-Oblique", 9)
+        c.drawString(margin, y, f"{clean_text(r.codigo_interno)}  ·  {display_talla(r.talla)}")
+        y -= 0.26 * inch
+
+        c.setFont("Helvetica", 9.2)
+        c.drawString(margin, y, "Precio")
+        c.drawRightString(width - margin, y, money(precio))
+        y -= 0.18 * inch
+        c.drawString(margin, y, f"Descuento {desc_pct:.0f}%")
+        c.drawRightString(width - margin, y, f"-{money(desc)}")
+        y -= 0.18 * inch
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawString(margin, y, "Neto")
+        c.drawRightString(width - margin, y, money(neto))
+        y -= 0.18 * inch
+        c.setFont("Helvetica", 9.2)
+        c.drawString(margin, y, "Pagado")
+        c.drawRightString(width - margin, y, money(pay))
+        y -= 0.18 * inch
+        c.drawString(margin, y, "Saldo pieza")
+        c.drawRightString(width - margin, y, money(sal))
+        y -= 0.26 * inch
+        c.setLineWidth(0.35)
+        c.line(margin, y, width - margin, y)
+        y -= 0.28 * inch
+
+    if y < 1.75 * inch:
+        c.showPage()
+        y = height - margin
+
+    box_h = 1.25 * inch
+    c.setLineWidth(0.8)
+    c.roundRect(margin, y - box_h, width - 2 * margin, box_h, 8, stroke=1, fill=0)
+
+    y2 = y - 0.32 * inch
+    c.setFont("Helvetica", 10)
+    c.drawString(margin + 0.25 * inch, y2, "Total neto")
+    c.drawRightString(width - margin - 0.25 * inch, y2, money(total))
+    y2 -= 0.24 * inch
+    c.drawString(margin + 0.25 * inch, y2, "Pagado")
+    c.drawRightString(width - margin - 0.25 * inch, y2, money(pagado_total))
+    y2 -= 0.31 * inch
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin + 0.25 * inch, y2, "SALDO PENDIENTE")
+    c.drawRightString(width - margin - 0.25 * inch, y2, money(saldo_total))
+
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
 
 # ============================================================
 # REPORTS / ADMIN
