@@ -1,8 +1,32 @@
-# Concherie Boutique App
+# Concherie Boutique v2.1
 
-Usuarios:
-- jc / master
-- ventas / moira
-- info / precio
+- Datos en Google Sheets
+- Fotos y notas PDF en Google Drive
+- Usuarios:
+  - jc / master
+  - ventas / moira
+  - info / precio
 
-Requiere Streamlit Secrets con Google Sheets y Drive.
+## Secrets necesarios
+
+Debe existir:
+
+```toml
+[connections.gsheets]
+spreadsheet = "..."
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = """-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----"""
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+
+[drive]
+folder_id = "..."
+```
