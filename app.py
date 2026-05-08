@@ -13,7 +13,7 @@ import qrcode
 import requests
 import streamlit as st
 from PIL import Image, ImageOps
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
@@ -369,8 +369,8 @@ def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="", gro
     df = df.sort_values(["marca", "producto", "color", "talla", "numero"])
 
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    w, h = landscape(A4)
     margin = 1.3 * cm
     card_w = (w - 2 * margin - 0.7 * cm) / 2
     card_h = 6.7 * cm
@@ -767,8 +767,8 @@ def draw_wrapped_text(c, text, x, y, max_width, font_name="Helvetica", font_size
 
 def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    w, h = landscape(A4)
     margin = 1.45 * cm
     y = h - margin
 
@@ -839,6 +839,21 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
             x += width
         y -= 0.58 * cm
 
+    def fit_cell_text(value, max_width, font_name="Helvetica", font_size=7.0):
+        """
+        Evita que el texto se monte sobre la siguiente columna.
+        Recorta por ancho real en PDF, no por número fijo de caracteres.
+        """
+        value = clean_text(value)
+        if c.stringWidth(value, font_name, font_size) <= max_width:
+            return value
+
+        ellipsis = "..."
+        while value and c.stringWidth(value + ellipsis, font_name, font_size) > max_width:
+            value = value[:-1]
+
+        return value + ellipsis if value else ""
+
     def table_row(values, widths, row_height=0.66 * cm):
         nonlocal y
         new_page_if_needed(row_height + 0.4 * cm)
@@ -847,10 +862,16 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
         c.setLineWidth(0.25)
         c.line(margin, y - row_height + 0.08 * cm, margin + sum(widths), y - row_height + 0.08 * cm)
         set_rgb(dark)
-        c.setFont("Helvetica", 7.4)
+        font_name = "Helvetica"
+        font_size = 7.0
+        c.setFont(font_name, font_size)
+
         for value, width in zip(values, widths):
-            c.drawString(x + 0.10 * cm, y - 0.35 * cm, clean_text(value)[:42])
+            available_width = width - 0.18 * cm
+            fitted = fit_cell_text(value, available_width, font_name, font_size)
+            c.drawString(x + 0.08 * cm, y - 0.35 * cm, fitted)
             x += width
+
         y -= row_height
 
     def draw_card_box(x, y_top, box_w, box_h, title, amount, accent=False):
@@ -906,10 +927,10 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
         y -= 0.6 * cm
     else:
         if show_discount:
-            widths = [1.45*cm, 1.35*cm, 6.05*cm, 1.75*cm, 2.15*cm, 2.0*cm]
+            widths = [1.5*cm, 1.3*cm, 12.0*cm, 1.9*cm, 2.5*cm, 2.2*cm]
             table_header(["Fecha", "Código", "Pieza", "Precio", "Descuento", "Total"], widths)
         else:
-            widths = [1.65*cm, 1.35*cm, 8.15*cm, 2.0*cm, 2.0*cm]
+            widths = [1.5*cm, 1.3*cm, 14.0*cm, 2.0*cm, 2.0*cm]
             table_header(["Fecha", "Código", "Pieza", "Precio", "Total"], widths)
 
         for _, r in vendidos_df.iterrows():
@@ -951,7 +972,7 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
     # Wishlist
     if not wishlist_df.empty:
         section_title("Wish list / Piezas reservadas")
-        widths = [1.65*cm, 1.35*cm, 9.0*cm, 2.4*cm]
+        widths = [1.5*cm, 1.3*cm, 15.0*cm, 2.4*cm]
         table_header(["Fecha", "Código", "Pieza", "Precio"], widths, fill_color=champagne, text_color=dark)
 
         for _, r in wishlist_df.iterrows():
