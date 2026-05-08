@@ -53,6 +53,14 @@ def clean_text(x):
     return str(x).strip()
 
 
+def normalize_col_name(x):
+    text = clean_text(x).lower().replace(" ", "_")
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
 def slugify(text):
     text = clean_text(text)
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
@@ -111,19 +119,25 @@ def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=REQUIRED_COLUMNS)
     df = df.copy()
-    df.columns = [clean_text(c).lower().replace(" ", "_") for c in df.columns]
+    df.columns = [normalize_col_name(c) for c in df.columns]
     aliases = {
-        "marca/maison": "marca",
+        "marca_maison": "marca",
         "maison": "marca",
+        "brand": "marca",
+        "designer": "marca",
+        "disenador": "marca",
         "cod": "codigo",
         "código": "codigo",
         "codigo_modelo": "codigo",
+        "modelo": "codigo",
         "articulo": "producto",
         "artículo": "producto",
         "descripcion": "producto",
         "descripción": "producto",
         "colour": "color",
+        "colour_name": "color",
         "size": "talla",
+        "tallas": "talla",
         "price": "precio",
         "photo": "foto_url",
     }
@@ -639,7 +653,7 @@ def read_invoice_excel(uploaded_file):
             if name not in xls.sheet_names:
                 return pd.DataFrame()
             data = pd.read_excel(uploaded_file, sheet_name=name)
-            data.columns = [clean_text(c).lower().replace(" ", "_") for c in data.columns]
+            data.columns = [normalize_col_name(c) for c in data.columns]
             return data
 
         cliente_df = read_sheet("CLIENTE")
@@ -1078,7 +1092,7 @@ def sidebar():
     if can_ventas():
         buttons += [("📸 Fotos", "fotos"), ("📄 Catálogo", "catalogo"), ("🧾 Notas de venta", "notas")]
     if can_admin():
-        buttons += [("📥 Cargar inventario", "cargar"), ("🏷️ Generar QR", "qr"), ("📦 Inventario", "inventario"), ("⚙️ Admin", "admin")]
+        buttons += [("📥 Cargar inventario", "cargar"), ("🏷️ Generar QR", "qr"), ("📦 Inventario", "inventario"), ("🧩 Reparar marcas", "reparar_marcas"), ("⚙️ Admin", "admin")]
 
     st.sidebar.divider()
     for label, page in buttons:
@@ -1146,6 +1160,7 @@ def home_page(df):
         with cols[2]:
             if st.button("🏷️ Generar QR", use_container_width=True): set_page("qr")
             if st.button("📥 Cargar inventario", use_container_width=True): set_page("cargar")
+            if st.button("🧩 Reparar marcas", use_container_width=True): set_page("reparar_marcas")
     st.divider()
     c1, c2, c3 = st.columns(3)
     c1.metric("Total piezas", len(df))
@@ -1345,68 +1360,179 @@ def infer_color_from_producto(producto):
 
 def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Si el Excel ya trae numero/codigo_interno, respeta ese formato.
-    Si es una transcripción por modelo con cantidad/llegaron, expande cada línea a piezas individuales
-    y asigna números únicos consecutivos.
+    Acepta dos formatos:
+    1) Inventario ya individualizado con numero/codigo_interno.
+    2) Transcripción por modelo con marca, codigo, producto, precio, cantidad/llegaron/llegó/pedido
+       y tallas en columnas Tallas, Tallas2, Tallas3...
     """
     raw = raw_df.copy()
-    raw.columns = [clean_text(c).lower().replace(" ", "_") for c in raw.columns]
+    raw.columns = [normalize_col_name(c) for c in raw.columns]
+
+    # Alias comunes
+    aliases = {
+        "marca_maison": "marca",
+        "maison": "marca",
+        "brand": "marca",
+        "designer": "marca",
+        "disenador": "marca",
+        "modelo": "codigo",
+        "descripcion": "producto",
+        "articulo": "producto",
+        "llego": "llegaron",
+        "llegada": "llegaron",
+        "pedido": "cantidad",
+    }
+    raw = raw.rename(columns={c: aliases.get(c, c) for c in raw.columns})
 
     has_piece_codes = "numero" in raw.columns or "codigo_interno" in raw.columns
+    if has_piece_codes:
+        return ensure_inventory_schema(raw)
 
     quantity_col = None
-    for candidate in ["llegaron", "cantidad", "qty"]:
+    for candidate in ["llegaron", "cantidad", "qty", "unidades"]:
         if candidate in raw.columns:
             quantity_col = candidate
             break
 
-    if has_piece_codes:
-        return ensure_inventory_schema(raw)
-
+    # Si no hay cantidad, intentamos igual con una pieza por línea.
     if not quantity_col:
-        return ensure_inventory_schema(raw)
+        raw["cantidad"] = 1
+        quantity_col = "cantidad"
 
+    # Columnas de tallas: talla, tallas, tallas2, tallas3...
+    talla_cols = []
+    for c in raw.columns:
+        if c == "talla" or c.startswith("talla") or c.startswith("tallas"):
+            talla_cols.append(c)
+
+    # Calcular cuántas piezas se van a crear.
     total_pieces = 0
-    quantities = []
+    expanded_plan = []
+
     for _, row in raw.iterrows():
+        # Ignorar filas resumen tipo TOTAL
+        producto = clean_text(row.get("producto", ""))
+        codigo = clean_text(row.get("codigo", ""))
+        if producto.upper() == "TOTAL" or codigo.upper() == "TOTAL":
+            continue
+
         q = row.get(quantity_col, 1)
         try:
             q = int(float(q))
         except Exception:
             q = 1
         q = max(q, 0)
-        quantities.append(q)
-        total_pieces += q
+
+        tallas = []
+        for tc in talla_cols:
+            val = clean_text(row.get(tc, ""))
+            if val and val.lower() not in ["nan", "none"]:
+                # Evita 40.0
+                try:
+                    if re.fullmatch(r"\d+\.0", val):
+                        val = str(int(float(val)))
+                except Exception:
+                    pass
+                tallas.append(f"T{val}" if val.isdigit() else val.upper())
+
+        # Si hay tallas, usamos las tallas como piezas. Si hay menos tallas que cantidad,
+        # completamos con talla única.
+        if tallas:
+            piece_tallas = tallas[:q] if q else tallas
+            while len(piece_tallas) < q:
+                piece_tallas.append("")
+        else:
+            piece_tallas = [""] * q
+
+        for talla in piece_tallas:
+            expanded_plan.append((row, talla))
+            total_pieces += 1
 
     generated_numbers = next_inventory_numbers(existing_df, total_pieces)
-    number_idx = 0
-
     expanded_rows = []
-    for idx, row in raw.iterrows():
-        q = quantities[idx]
-        for _ in range(q):
-            numero = generated_numbers[number_idx]
-            number_idx += 1
 
-            producto = clean_text(row.get("producto", ""))
-            codigo = clean_text(row.get("codigo", ""))
-            color = clean_text(row.get("color", "")) or infer_color_from_producto(producto)
-            talla = clean_text(row.get("talla", ""))
+    for idx, (row, talla) in enumerate(expanded_plan):
+        numero = generated_numbers[idx]
+        producto = clean_text(row.get("producto", ""))
+        codigo = clean_text(row.get("codigo", ""))
+        marca = clean_text(row.get("marca", ""))
+        color = clean_text(row.get("color", "")) or infer_color_from_producto(producto)
 
-            expanded_rows.append({
-                "numero": numero,
-                "marca": clean_text(row.get("marca", "")) or clean_text(row.get("marca/maison", "")) or clean_text(row.get("maison", "")),
-                "codigo": codigo,
-                "producto": producto,
-                "color": color,
-                "talla": talla,
-                "precio": row.get("precio", 0),
-                "foto_url": row.get("foto_url", ""),
-                "fecha_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
+        expanded_rows.append({
+            "numero": numero,
+            "marca": marca,
+            "codigo": codigo,
+            "producto": producto,
+            "color": color,
+            "talla": talla,
+            "precio": row.get("precio", 0),
+            "foto_url": row.get("foto_url", ""),
+            "fecha_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
 
     return ensure_inventory_schema(pd.DataFrame(expanded_rows))
 
+
+def build_brand_map_from_excel(uploaded_file):
+    """
+    Lee un Excel de inventario/transcripción y devuelve mapa codigo -> marca.
+    Sirve para reparar inventarios viejos que quedaron sin marca.
+    """
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+        sheet = "inventario" if "inventario" in xls.sheet_names else xls.sheet_names[0]
+        raw = pd.read_excel(uploaded_file, sheet_name=sheet)
+    except Exception:
+        return {}
+
+    raw.columns = [normalize_col_name(c) for c in raw.columns]
+    aliases = {
+        "marca_maison": "marca",
+        "maison": "marca",
+        "brand": "marca",
+        "designer": "marca",
+        "disenador": "marca",
+        "modelo": "codigo",
+    }
+    raw = raw.rename(columns={c: aliases.get(c, c) for c in raw.columns})
+
+    if "marca" not in raw.columns or "codigo" not in raw.columns:
+        return {}
+
+    brand_map = {}
+    for _, row in raw.iterrows():
+        codigo = clean_text(row.get("codigo", "")).upper()
+        marca = clean_text(row.get("marca", "")).upper()
+        if codigo and marca and codigo != "TOTAL":
+            brand_map[codigo] = marca
+
+    return brand_map
+
+
+def repair_inventory_brands(df: pd.DataFrame, uploaded_files):
+    df = ensure_inventory_schema(df)
+    if "marca" not in df.columns:
+        df["marca"] = ""
+
+    combined_map = {}
+    for uploaded in uploaded_files:
+        combined_map.update(build_brand_map_from_excel(uploaded))
+
+    repaired = df.copy()
+    updates = 0
+
+    for idx, row in repaired.iterrows():
+        current_brand = clean_text(row.get("marca", ""))
+        codigo = clean_text(row.get("codigo", "")).upper()
+
+        if current_brand and current_brand.upper() not in ["SIN MARCA", "NAN", "NONE"]:
+            continue
+
+        if codigo in combined_map:
+            repaired.at[idx, "marca"] = combined_map[codigo]
+            updates += 1
+
+    return ensure_inventory_schema(repaired), updates, combined_map
 
 def cargar_page(df):
     st.title("Cargar inventario")
@@ -1494,6 +1620,50 @@ def admin_page(df):
                     st.error("Confirmación o clave incorrecta.")
         else:
             st.error("No encontré esa pieza.")
+
+
+def reparar_marcas_page(df):
+    st.title("Reparar marcas del inventario")
+    st.info(
+        "Usa esta opción si el inventario ya fue cargado antes y aparece como SIN MARCA. "
+        "Sube los Excels originales de transcripción; la app usará el código/modelo para rellenar la marca."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Excels originales con marca",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+    )
+
+    if not uploaded_files:
+        st.caption("Ejemplo: Dice_Kayek_transcripcion.xlsx, Gianluca_Capannolo_transcripcion.xlsx, etc.")
+        return
+
+    repaired, updates, brand_map = repair_inventory_brands(df, uploaded_files)
+
+    st.metric("Marcas detectadas por código/modelo", len(brand_map))
+    st.metric("Piezas que se actualizarán", updates)
+
+    if brand_map:
+        preview_map = pd.DataFrame(
+            [{"codigo": k, "marca": v} for k, v in sorted(brand_map.items())]
+        )
+        st.markdown("### Mapa detectado")
+        st.dataframe(preview_map, use_container_width=True)
+
+    if updates > 0:
+        st.markdown("### Vista previa del inventario reparado")
+        st.dataframe(repaired[["numero", "marca", "codigo", "producto", "color", "talla", "precio"]], use_container_width=True)
+
+        if st.button("Guardar marcas reparadas", type="primary", use_container_width=True):
+            ok, msg = save_inventory(repaired)
+            if ok:
+                st.success(f"Inventario actualizado. Se repararon {updates} piezas.")
+                st.rerun()
+            else:
+                st.error(msg)
+    else:
+        st.warning("No encontré piezas para actualizar. Puede que ya tengan marca o que los códigos no coincidan.")
 
 # ============================================================
 # MAIN
