@@ -34,6 +34,7 @@ INVENTORY_SHEET = "inventario"
 REQUIRED_COLUMNS = [
     "numero",
     "codigo_interno",
+    "marca",
     "codigo",
     "producto",
     "color",
@@ -133,6 +134,7 @@ def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = "" if col != "precio" else 0.0
 
     df["numero"] = df.apply(lambda r: normalize_numero(r.get("numero")) or normalize_numero(r.get("codigo_interno")), axis=1)
+    df["marca"] = df["marca"].apply(clean_text).str.upper()
     df["codigo"] = df["codigo"].apply(clean_text).str.upper()
     df["producto"] = df["producto"].apply(clean_text).str.upper()
     df["color"] = df["color"].apply(clean_text).str.upper()
@@ -340,41 +342,81 @@ def build_labels_pdf(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="") -> bytes:
+def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="", group_by_brand=True) -> bytes:
     df = ensure_inventory_schema(df)
     if talla_filter.strip():
         tf = talla_filter.strip().upper()
         df = df[df["talla"].astype(str).str.upper().str.contains(tf, na=False)]
-    df = df.sort_values(["producto", "color", "talla", "numero"])
+
+    if "marca" not in df.columns:
+        df["marca"] = ""
+
+    df["marca"] = df["marca"].apply(clean_text).replace("", "SIN MARCA")
+    df = df.sort_values(["marca", "producto", "color", "talla", "numero"])
 
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
     margin = 1.3 * cm
     card_w = (w - 2 * margin - 0.7 * cm) / 2
-    card_h = 6.4 * cm
+    card_h = 6.7 * cm
     gap = 0.7 * cm
 
-    def header():
+    def header(subtitle="Catálogo disponible"):
+        c.setFillColorRGB(0, 0, 0)
         c.setFont("Helvetica-Bold", 20)
         c.drawString(margin, h - margin, "CONCHERIE BOUTIQUE")
         c.setFont("Helvetica", 10)
-        c.drawString(margin, h - margin - 0.45 * cm, "Catálogo disponible")
+        c.drawString(margin, h - margin - 0.45 * cm, subtitle)
+
+    def brand_header(brand_name):
+        nonlocal y, col
+        if col != 0:
+            col = 0
+            y -= card_h + 0.55 * cm
+        if y < margin + card_h + 1.2 * cm:
+            c.showPage()
+            header()
+            y = h - margin - 1.3 * cm
+        c.setFillColorRGB(0.10, 0.10, 0.10)
+        c.roundRect(margin, y - 0.65 * cm, w - 2 * margin, 0.62 * cm, 6, fill=1, stroke=0)
+        c.setFillColorRGB(1, 1, 1)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin + 0.25 * cm, y - 0.43 * cm, clean_text(brand_name))
+        y -= 1.05 * cm
 
     header()
     y = h - margin - 1.3 * cm
     col = 0
+    current_brand = None
 
     for _, row in df.iterrows():
+        brand = clean_text(row.get("marca")) or "SIN MARCA"
+
+        if group_by_brand and brand != current_brand:
+            current_brand = brand
+            brand_header(brand)
+
         if y - card_h < margin:
             c.showPage()
             header()
             y = h - margin - 1.3 * cm
             col = 0
+            if group_by_brand:
+                brand_header(brand)
+
         x = margin + col * (card_w + gap)
 
         c.setStrokeColorRGB(0.85, 0.85, 0.85)
+        c.setFillColorRGB(1, 1, 1)
         c.roundRect(x, y - card_h, card_w, card_h, 8, stroke=1, fill=0)
+
+        # Brand pill inside card
+        c.setFillColorRGB(0.93, 0.90, 0.84)
+        c.roundRect(x + 0.25 * cm, y - 0.58 * cm, card_w - 0.5 * cm, 0.38 * cm, 5, fill=1, stroke=0)
+        c.setFillColorRGB(0.16, 0.16, 0.16)
+        c.setFont("Helvetica-Bold", 7.3)
+        c.drawString(x + 0.42 * cm, y - 0.45 * cm, brand[:32])
 
         # photo area
         photo_url = clean_text(row.get("foto_url"))
@@ -383,28 +425,38 @@ def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="") -> 
                 img_data = requests.get(photo_url, timeout=10).content
                 img = Image.open(io.BytesIO(img_data)).convert("RGB")
                 img.thumbnail((500, 500))
-                c.drawImage(pil_to_reader(img), x + 0.3 * cm, y - 3.6 * cm, width=2.9 * cm, height=2.9 * cm, preserveAspectRatio=True, anchor="c")
+                c.drawImage(
+                    pil_to_reader(img),
+                    x + 0.3 * cm,
+                    y - 4.0 * cm,
+                    width=2.9 * cm,
+                    height=2.9 * cm,
+                    preserveAspectRatio=True,
+                    anchor="c",
+                )
             except Exception:
                 c.setFillColorRGB(0.95, 0.95, 0.95)
-                c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
+                c.rect(x + 0.3 * cm, y - 4.0 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
         else:
             c.setFillColorRGB(0.96, 0.96, 0.96)
-            c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
+            c.rect(x + 0.3 * cm, y - 4.0 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
             c.setFillColorRGB(0.45, 0.45, 0.45)
             c.setFont("Helvetica", 8)
-            c.drawCentredString(x + 1.75 * cm, y - 2.15 * cm, "Sin foto")
+            c.drawCentredString(x + 1.75 * cm, y - 2.55 * cm, "Sin foto")
 
         tx = x + 3.55 * cm
         c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 9.5)
-        c.drawString(tx, y - 0.7 * cm, f"{normalize_numero(row['numero'])} · {clean_text(row['producto'])[:24]}")
+        c.setFont("Helvetica-Bold", 9.2)
+        c.drawString(tx, y - 1.03 * cm, f"{normalize_numero(row['numero'])} · {clean_text(row['producto'])[:24]}")
         c.setFont("Helvetica-Oblique", 8)
-        c.drawString(tx, y - 1.2 * cm, f"{clean_text(row['color'])} · {display_talla(row['talla'])}")
+        c.drawString(tx, y - 1.52 * cm, f"{clean_text(row['color'])} · {display_talla(row['talla'])}")
         c.setFont("Helvetica", 7)
-        c.drawString(tx, y - 1.7 * cm, clean_text(row["codigo_interno"])[:30])
+        c.drawString(tx, y - 2.02 * cm, clean_text(row["codigo_interno"])[:30])
+
         if include_price:
             c.setFont("Helvetica-Bold", 14)
-            c.drawString(tx, y - 2.55 * cm, money(row["precio"]))
+            c.drawString(tx, y - 2.88 * cm, money(row["precio"]))
+
         col += 1
         if col == 2:
             col = 0
@@ -413,8 +465,6 @@ def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="") -> 
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
-
-
 
 
 # ============================================================
@@ -459,27 +509,153 @@ def find_product_by_sale_code(df, value):
     return matches.iloc[0]
 
 
+def normalize_header_label(value):
+    label = clean_text(value).lower()
+    label = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode("ascii")
+    label = label.replace(" ", "_")
+    return label
+
+
+def read_single_sheet_invoice(uploaded_file, sheet_name):
+    """
+    Lee un formato visual sencillo, como:
+        Cliente
+        Josefina Fernandez
+
+                  vendido | descuento | apartado
+                      78  |    15     |    99
+
+    También intenta leer pagos si encuentra encabezados tipo:
+        fecha_pago | forma_pago | monto_pago
+    """
+    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
+
+    cliente = "Cliente"
+
+    # Buscar celda que diga Cliente. Toma el valor debajo o a la derecha.
+    for r in range(raw.shape[0]):
+        for c in range(raw.shape[1]):
+            if normalize_header_label(raw.iat[r, c]) == "cliente":
+                below = raw.iat[r + 1, c] if r + 1 < raw.shape[0] else ""
+                right = raw.iat[r, c + 1] if c + 1 < raw.shape[1] else ""
+                cliente = clean_text(below) or clean_text(right) or "Cliente"
+                break
+
+    vendidos_rows = []
+    wishlist_rows = []
+    pagos_rows = []
+
+    # Buscar encabezado de piezas.
+    piezas_header_row = None
+    header_map = {}
+    for r in range(raw.shape[0]):
+        labels = [normalize_header_label(raw.iat[r, c]) for c in range(raw.shape[1])]
+        if "vendido" in labels or "apartado" in labels or "wishlist" in labels or "wish_list" in labels:
+            piezas_header_row = r
+            for c, label in enumerate(labels):
+                if label in ["vendido", "vendidos", "codigo_vendido", "pieza_vendida"]:
+                    header_map["vendido"] = c
+                elif label in ["descuento", "descuento_pct", "desc"]:
+                    header_map["descuento_pct"] = c
+                elif label in ["apartado", "wishlist", "wish_list", "reservado", "reservada"]:
+                    header_map["apartado"] = c
+                elif label in ["fecha", "fecha_venta"]:
+                    header_map["fecha"] = c
+            break
+
+    if piezas_header_row is not None:
+        for r in range(piezas_header_row + 1, raw.shape[0]):
+            vendido = raw.iat[r, header_map["vendido"]] if "vendido" in header_map else ""
+            apartado = raw.iat[r, header_map["apartado"]] if "apartado" in header_map else ""
+
+            # Si la fila ya parece ser otra sección, paramos.
+            row_labels = [normalize_header_label(raw.iat[r, c]) for c in range(raw.shape[1])]
+            if any(x in row_labels for x in ["fecha_pago", "forma_pago", "monto_pago", "monto"]):
+                break
+
+            descuento = raw.iat[r, header_map["descuento_pct"]] if "descuento_pct" in header_map else ""
+            fecha = raw.iat[r, header_map["fecha"]] if "fecha" in header_map else datetime.now().strftime("%d/%m/%Y")
+
+            if clean_text(vendido):
+                vendidos_rows.append({
+                    "fecha": fecha,
+                    "codigo": vendido,
+                    "descuento_pct": descuento,
+                })
+
+            if clean_text(apartado):
+                wishlist_rows.append({
+                    "fecha": fecha,
+                    "codigo": apartado,
+                })
+
+    # Buscar encabezado de pagos, si existe en la misma hoja.
+    pagos_header_row = None
+    pagos_map = {}
+    for r in range(raw.shape[0]):
+        labels = [normalize_header_label(raw.iat[r, c]) for c in range(raw.shape[1])]
+        has_pago_header = (
+            "fecha_pago" in labels
+            or "forma_pago" in labels
+            or "monto_pago" in labels
+            or ("monto" in labels and ("forma" in labels or "forma_de_pago" in labels))
+        )
+        if has_pago_header:
+            pagos_header_row = r
+            for c, label in enumerate(labels):
+                if label in ["fecha_pago", "fecha"]:
+                    pagos_map["fecha_pago"] = c
+                elif label in ["forma_pago", "forma_de_pago", "forma"]:
+                    pagos_map["forma_pago"] = c
+                elif label in ["monto_pago", "monto", "abono", "pagado"]:
+                    pagos_map["monto_pago"] = c
+            break
+
+    if pagos_header_row is not None:
+        for r in range(pagos_header_row + 1, raw.shape[0]):
+            monto = raw.iat[r, pagos_map["monto_pago"]] if "monto_pago" in pagos_map else ""
+            if not clean_text(monto):
+                continue
+            pagos_rows.append({
+                "fecha_pago": raw.iat[r, pagos_map["fecha_pago"]] if "fecha_pago" in pagos_map else "",
+                "forma_pago": raw.iat[r, pagos_map["forma_pago"]] if "forma_pago" in pagos_map else "",
+                "monto_pago": monto,
+            })
+
+    return (
+        cliente,
+        pd.DataFrame(vendidos_rows),
+        pd.DataFrame(wishlist_rows),
+        pd.DataFrame(pagos_rows),
+    )
+
+
 def read_invoice_excel(uploaded_file):
     xls = pd.ExcelFile(uploaded_file)
 
-    def read_sheet(name):
-        if name not in xls.sheet_names:
-            return pd.DataFrame()
-        data = pd.read_excel(uploaded_file, sheet_name=name)
-        data.columns = [clean_text(c).lower().replace(" ", "_") for c in data.columns]
-        return data
+    # Formato antiguo por hojas separadas
+    if any(name in xls.sheet_names for name in ["CLIENTE", "VENDIDOS", "WISHLIST", "PAGOS"]):
+        def read_sheet(name):
+            if name not in xls.sheet_names:
+                return pd.DataFrame()
+            data = pd.read_excel(uploaded_file, sheet_name=name)
+            data.columns = [clean_text(c).lower().replace(" ", "_") for c in data.columns]
+            return data
 
-    cliente_df = read_sheet("CLIENTE")
-    vendidos_df = read_sheet("VENDIDOS")
-    wishlist_df = read_sheet("WISHLIST")
-    pagos_df = read_sheet("PAGOS")
+        cliente_df = read_sheet("CLIENTE")
+        vendidos_df = read_sheet("VENDIDOS")
+        wishlist_df = read_sheet("WISHLIST")
+        pagos_df = read_sheet("PAGOS")
 
-    if cliente_df.empty or "cliente" not in cliente_df.columns:
-        cliente = "Cliente"
-    else:
-        cliente = clean_text(cliente_df.iloc[0]["cliente"]) or "Cliente"
+        if cliente_df.empty or "cliente" not in cliente_df.columns:
+            cliente = "Cliente"
+        else:
+            cliente = clean_text(cliente_df.iloc[0]["cliente"]) or "Cliente"
 
-    return cliente, vendidos_df, wishlist_df, pagos_df
+        return cliente, vendidos_df, wishlist_df, pagos_df
+
+    # Formato nuevo visual en una sola hoja
+    return read_single_sheet_invoice(uploaded_file, xls.sheet_names[0])
 
 
 def process_invoice_data(df_inventory, vendidos_excel, wishlist_excel, pagos_excel):
@@ -507,6 +683,7 @@ def process_invoice_data(df_inventory, vendidos_excel, wishlist_excel, pagos_exc
                 "fecha": safe_date(row.get("fecha", "")),
                 "codigo": normalize_numero(pieza["numero"]),
                 "codigo_interno": clean_text(pieza["codigo_interno"]),
+                "marca": clean_text(pieza.get("marca", "")),
                 "producto": clean_text(pieza["producto"]),
                 "color": clean_text(pieza["color"]),
                 "talla": display_talla(pieza["talla"]),
@@ -531,6 +708,7 @@ def process_invoice_data(df_inventory, vendidos_excel, wishlist_excel, pagos_exc
                 "fecha": safe_date(row.get("fecha", "")),
                 "codigo": normalize_numero(pieza["numero"]),
                 "codigo_interno": clean_text(pieza["codigo_interno"]),
+                "marca": clean_text(pieza.get("marca", "")),
                 "producto": clean_text(pieza["producto"]),
                 "color": clean_text(pieza["color"]),
                 "talla": display_talla(pieza["talla"]),
@@ -577,66 +755,128 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     w, h = A4
-    margin = 1.5 * cm
+    margin = 1.45 * cm
     y = h - margin
+
+    dark = (0.12, 0.12, 0.16)
+    taupe = (0.66, 0.58, 0.46)
+    champagne = (0.94, 0.90, 0.82)
+    soft = (0.98, 0.97, 0.94)
+    line = (0.82, 0.80, 0.76)
+
+    def set_rgb(rgb):
+        c.setFillColorRGB(rgb[0], rgb[1], rgb[2])
+
+    def stroke_rgb(rgb):
+        c.setStrokeColorRGB(rgb[0], rgb[1], rgb[2])
 
     def new_page_if_needed(required_space=2.5 * cm):
         nonlocal y
         if y < margin + required_space:
+            footer()
             c.showPage()
             y = h - margin
+            header(compact=True)
+
+    def header(compact=False):
+        nonlocal y
+        set_rgb(dark)
+        c.setFont("Helvetica-Bold", 26 if not compact else 20)
+        c.drawString(margin, y, "MC")
+        c.setFont("Helvetica", 11 if not compact else 9)
+        c.drawString(margin, y - (0.48 * cm if not compact else 0.38 * cm), "Prêt-à-porter")
+
+        c.setFont("Helvetica", 8)
+        c.drawRightString(w - margin, y, "Nota de venta")
+        c.drawRightString(w - margin, y - 0.38 * cm, datetime.now().strftime("%d/%m/%Y"))
+
+        stroke_rgb(taupe)
+        c.setLineWidth(0.7)
+        c.line(margin, y - (0.78 * cm if not compact else 0.62 * cm), w - margin, y - (0.78 * cm if not compact else 0.62 * cm))
+        y -= 1.15 * cm if not compact else 0.95 * cm
+
+    def footer():
+        c.setFont("Helvetica", 7.5)
+        set_rgb((0.45, 0.45, 0.45))
+        c.drawCentredString(w / 2, 0.9 * cm, "MC Prêt-à-porter")
 
     def section_title(title):
         nonlocal y
-        new_page_if_needed(1.5 * cm)
-        c.setFont("Helvetica-Bold", 13)
-        c.setFillColorRGB(0, 0, 0)
+        new_page_if_needed(1.4 * cm)
+        set_rgb(dark)
+        c.setFont("Helvetica-Bold", 12.5)
         c.drawString(margin, y, title)
-        y -= 0.55 * cm
+        y -= 0.35 * cm
+        stroke_rgb(taupe)
+        c.setLineWidth(0.4)
+        c.line(margin, y, w - margin, y)
+        y -= 0.35 * cm
 
-    def table_header(headers, widths, fill=(0.1, 0.1, 0.1), text_color=(1, 1, 1)):
+    def table_header(headers, widths, fill_color=dark, text_color=(1, 1, 1)):
         nonlocal y
+        new_page_if_needed(1.2 * cm)
         x = margin
-        c.setFillColorRGB(*fill)
-        c.rect(margin, y - 0.42 * cm, sum(widths), 0.52 * cm, fill=1, stroke=0)
-        c.setFillColorRGB(*text_color)
-        c.setFont("Helvetica-Bold", 7.8)
+        set_rgb(fill_color)
+        c.roundRect(margin, y - 0.48 * cm, sum(widths), 0.52 * cm, 5, fill=1, stroke=0)
+        set_rgb(text_color)
+        c.setFont("Helvetica-Bold", 7.4)
         for header, width in zip(headers, widths):
-            c.drawString(x + 0.08 * cm, y - 0.25 * cm, header)
+            c.drawString(x + 0.10 * cm, y - 0.29 * cm, header)
             x += width
-        y -= 0.52 * cm
+        y -= 0.58 * cm
 
-    def table_row(values, widths, row_height=0.62 * cm):
+    def table_row(values, widths, row_height=0.66 * cm):
         nonlocal y
-        new_page_if_needed(row_height + 0.5 * cm)
+        new_page_if_needed(row_height + 0.4 * cm)
         x = margin
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica", 7.5)
-        c.setStrokeColorRGB(0.82, 0.82, 0.82)
+        stroke_rgb(line)
+        c.setLineWidth(0.25)
         c.line(margin, y - row_height + 0.08 * cm, margin + sum(widths), y - row_height + 0.08 * cm)
+        set_rgb(dark)
+        c.setFont("Helvetica", 7.4)
         for value, width in zip(values, widths):
-            c.drawString(x + 0.08 * cm, y - 0.33 * cm, clean_text(value)[:36])
+            c.drawString(x + 0.10 * cm, y - 0.35 * cm, clean_text(value)[:42])
             x += width
         y -= row_height
 
-    # Header
-    c.setFont("Helvetica-Bold", 22)
-    c.drawString(margin, y, "CONCHERIE")
-    y -= 0.7 * cm
-    c.setFont("Helvetica", 10)
-    c.drawString(margin, y, "Nota de venta")
-    y -= 0.75 * cm
+    def draw_card_box(x, y_top, box_w, box_h, title, amount, accent=False):
+        set_rgb(champagne if accent else soft)
+        stroke_rgb((0.88, 0.85, 0.78))
+        c.roundRect(x, y_top - box_h, box_w, box_h, 8, fill=1, stroke=1)
+        set_rgb((0.36, 0.34, 0.31))
+        c.setFont("Helvetica", 7.5)
+        c.drawString(x + 0.25 * cm, y_top - 0.38 * cm, title)
+        set_rgb(dark)
+        c.setFont("Helvetica-Bold", 12.5)
+        c.drawString(x + 0.25 * cm, y_top - 0.92 * cm, amount)
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(margin, y, "Cliente:")
-    c.setFont("Helvetica", 10)
-    c.drawString(margin + 1.8 * cm, y, cliente)
-    y -= 0.45 * cm
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(margin, y, "Fecha:")
-    c.setFont("Helvetica", 10)
-    c.drawString(margin + 1.8 * cm, y, datetime.now().strftime("%d/%m/%Y"))
-    y -= 0.9 * cm
+    header()
+
+    # Client block
+    set_rgb(soft)
+    stroke_rgb((0.90, 0.87, 0.80))
+    c.roundRect(margin, y - 1.35 * cm, w - 2 * margin, 1.20 * cm, 10, fill=1, stroke=1)
+    set_rgb((0.42, 0.38, 0.32))
+    c.setFont("Helvetica", 8)
+    c.drawString(margin + 0.35 * cm, y - 0.45 * cm, "CLIENTE")
+    set_rgb(dark)
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(margin + 0.35 * cm, y - 0.92 * cm, cliente)
+    y -= 1.75 * cm
+
+    # Totals
+    subtotal = float(vendidos_df["precio"].sum()) if not vendidos_df.empty else 0.0
+    descuento_total = float(vendidos_df["descuento_monto"].sum()) if not vendidos_df.empty and "descuento_monto" in vendidos_df.columns else 0.0
+    total_vendido = float(vendidos_df["total"].sum()) if not vendidos_df.empty else 0.0
+    total_pagado = float(pagos_df["monto_pago"].sum()) if not pagos_df.empty and "monto_pago" in pagos_df.columns else 0.0
+    saldo = total_vendido - total_pagado
+
+    card_gap = 0.35 * cm
+    card_w = (w - 2 * margin - 2 * card_gap) / 3
+    draw_card_box(margin, y, card_w, 1.15 * cm, "TOTAL VENDIDO", money(total_vendido), accent=True)
+    draw_card_box(margin + card_w + card_gap, y, card_w, 1.15 * cm, "PAGADO A LA FECHA", money(total_pagado))
+    draw_card_box(margin + 2 * (card_w + card_gap), y, card_w, 1.15 * cm, "SALDO PENDIENTE", money(saldo), accent=True)
+    y -= 1.55 * cm
 
     # Vendidos
     section_title("Piezas vendidas")
@@ -646,97 +886,85 @@ def build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df) -> bytes:
         show_discount = vendidos_df["descuento_pct"].fillna(0).sum() > 0
 
     if vendidos_df.empty:
+        set_rgb((0.45, 0.45, 0.45))
         c.setFont("Helvetica", 9)
         c.drawString(margin, y, "No hay piezas vendidas registradas.")
         y -= 0.6 * cm
     else:
         if show_discount:
-            widths = [1.7*cm, 1.4*cm, 5.2*cm, 2.0*cm, 2.2*cm, 2.0*cm]
+            widths = [1.45*cm, 1.35*cm, 6.05*cm, 1.75*cm, 2.15*cm, 2.0*cm]
             table_header(["Fecha", "Código", "Pieza", "Precio", "Descuento", "Total"], widths)
         else:
-            widths = [1.9*cm, 1.5*cm, 7.5*cm, 2.3*cm, 2.3*cm]
+            widths = [1.65*cm, 1.35*cm, 8.15*cm, 2.0*cm, 2.0*cm]
             table_header(["Fecha", "Código", "Pieza", "Precio", "Total"], widths)
 
         for _, r in vendidos_df.iterrows():
-            pieza_txt = f"{r['producto']} · {r['color']} · {r['talla']}"
+            marca = clean_text(r.get("marca", ""))
+            pieza_txt = f"{marca + ' · ' if marca else ''}{r['producto']} · {r['color']} · {r['talla']}"
             if show_discount:
                 desc = ""
                 if float(r["descuento_pct"]) > 0:
                     desc = f"{float(r['descuento_pct']):.0f}% / -{money(r['descuento_monto'])}"
-                table_row([
-                    r["fecha"],
-                    r["codigo"],
-                    pieza_txt,
-                    money(r["precio"]),
-                    desc,
-                    money(r["total"])
-                ], widths)
+                table_row([r["fecha"], r["codigo"], pieza_txt, money(r["precio"]), desc, money(r["total"])], widths)
             else:
-                table_row([
-                    r["fecha"],
-                    r["codigo"],
-                    pieza_txt,
-                    money(r["precio"]),
-                    money(r["total"])
-                ], widths)
+                table_row([r["fecha"], r["codigo"], pieza_txt, money(r["precio"]), money(r["total"])], widths)
 
-    subtotal = float(vendidos_df["precio"].sum()) if not vendidos_df.empty else 0.0
-    descuento_total = float(vendidos_df["descuento_monto"].sum()) if not vendidos_df.empty and "descuento_monto" in vendidos_df.columns else 0.0
-    total_vendido = float(vendidos_df["total"].sum()) if not vendidos_df.empty else 0.0
-    total_pagado = float(pagos_df["monto_pago"].sum()) if not pagos_df.empty and "monto_pago" in pagos_df.columns else 0.0
-    saldo = total_vendido - total_pagado
+    y -= 0.25 * cm
 
-    y -= 0.3 * cm
-    summary_x = w - margin - 7.0 * cm
-    summary = [("Subtotal", subtotal)]
+    # Summary line
     if descuento_total > 0:
-        summary.append(("Descuento total", -descuento_total))
-    summary += [("Total vendido", total_vendido), ("Pagado a la fecha", total_pagado), ("Saldo pendiente", saldo)]
-
-    for label, amount in summary:
-        new_page_if_needed(0.45 * cm)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(summary_x, y, label)
-        c.drawRightString(w - margin, y, money(amount))
-        y -= 0.42 * cm
-
-    y -= 0.4 * cm
+        new_page_if_needed(1.2 * cm)
+        set_rgb((0.35, 0.35, 0.35))
+        c.setFont("Helvetica", 8.5)
+        c.drawRightString(w - margin - 3.8 * cm, y, "Subtotal")
+        c.drawRightString(w - margin, y, money(subtotal))
+        y -= 0.38 * cm
+        c.drawRightString(w - margin - 3.8 * cm, y, "Descuento total")
+        c.drawRightString(w - margin, y, f"-{money(descuento_total)}")
+        y -= 0.50 * cm
 
     # Pagos
     if not pagos_df.empty:
         section_title("Pagos registrados")
-        widths = [2.4*cm, 7.0*cm, 3.0*cm]
-        table_header(["Fecha", "Forma de pago", "Monto"], widths, fill=(0.35, 0.35, 0.35))
+        widths = [2.2*cm, 8.0*cm, 3.0*cm]
+        table_header(["Fecha", "Forma de pago", "Monto"], widths, fill_color=taupe, text_color=(1, 1, 1))
         for _, r in pagos_df.iterrows():
             if clean_text(r.get("monto_pago", "")) == "":
                 continue
             table_row([r["fecha_pago"], r["forma_pago"], money(r["monto_pago"])], widths)
-        y -= 0.5 * cm
+        y -= 0.45 * cm
 
     # Wishlist
     if not wishlist_df.empty:
         section_title("Wish list / Piezas reservadas")
-        widths = [1.8*cm, 1.5*cm, 8.0*cm, 2.6*cm]
-        table_header(["Fecha", "Código", "Pieza", "Precio"], widths, fill=(0.78, 0.70, 0.56), text_color=(0, 0, 0))
-        for _, r in wishlist_df.iterrows():
-            pieza_txt = f"{r['producto']} · {r['color']} · {r['talla']}"
-            table_row([r["fecha"], r["codigo"], pieza_txt, money(r["precio"])], widths)
-        y -= 0.35 * cm
+        widths = [1.65*cm, 1.35*cm, 9.0*cm, 2.4*cm]
+        table_header(["Fecha", "Código", "Pieza", "Precio"], widths, fill_color=champagne, text_color=dark)
 
+        for _, r in wishlist_df.iterrows():
+            marca = clean_text(r.get("marca", ""))
+            pieza_txt = f"{marca + ' · ' if marca else ''}{r['producto']} · {r['color']} · {r['talla']}"
+            table_row([r["fecha"], r["codigo"], pieza_txt, money(r["precio"])], widths)
+
+        y -= 0.35 * cm
         new_page_if_needed(1.5 * cm)
-        c.setFont("Helvetica-Oblique", 8.8)
-        c.setFillColorRGB(0.25, 0.25, 0.25)
+
+        set_rgb(soft)
+        stroke_rgb((0.90, 0.87, 0.80))
+        c.roundRect(margin, y - 1.22 * cm, w - 2 * margin, 1.05 * cm, 8, fill=1, stroke=1)
+        set_rgb((0.30, 0.30, 0.30))
+        c.setFont("Helvetica-Oblique", 8.2)
         note = (
             "Las piezas incluidas en el wish list se mantienen temporalmente reservadas para la cliente. "
             "Agradecemos confirmar la decisión dentro de un tiempo prudencial, para que en caso de no continuar "
             "con la compra puedan volver a estar disponibles para la venta."
         )
-        y = draw_wrapped_text(c, note, margin, y, w - 2*margin, "Helvetica-Oblique", 8.8, 11, max_lines=4)
+        draw_wrapped_text(c, note, margin + 0.30 * cm, y - 0.48 * cm, w - 2*margin - 0.6*cm, "Helvetica-Oblique", 8.2, 10, max_lines=3)
+        y -= 1.42 * cm
 
+    footer()
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
-
 
 def invoice_page(df):
     st.title("Notas de venta")
@@ -746,33 +974,23 @@ def invoice_page(df):
 
     with st.expander("Formato esperado del Excel"):
         st.markdown("""
-El archivo debe tener estas hojas:
+Puedes usar el formato sencillo en una sola hoja:
 
-**CLIENTE**
+|  |  | vendido | descuento |  | apartado |
+|---|---|---:|---:|---|---:|
+|  |  | 078 | 15 |  | 099 |
+|  |  | 045 |  |  | 033 |
 
-| cliente |
-|---|
-| María Pérez |
+Arriba debe aparecer una celda que diga **Cliente** y debajo el nombre de la cliente.
 
-**VENDIDOS**
-
-| fecha | codigo | descuento_pct |
-|---|---:|---:|
-| 07/05/2026 | 066 | |
-| 07/05/2026 | 067 | 10 |
-
-**WISHLIST**
-
-| fecha | codigo |
-|---|---:|
-| 07/05/2026 | 070 |
-
-**PAGOS**
+También puedes agregar pagos en la misma hoja con columnas:
 
 | fecha_pago | forma_pago | monto_pago |
 |---|---|---:|
 | 07/05/2026 | Zelle | 200 |
 | 08/05/2026 | Efectivo | 150 |
+
+La app también sigue aceptando el formato anterior por hojas separadas: CLIENTE, VENDIDOS, WISHLIST y PAGOS.
 """)
 
     if not uploaded:
@@ -789,7 +1007,7 @@ El archivo debe tener estas hojas:
 
         if not vendidos_df.empty:
             st.markdown("### Piezas vendidas")
-            cols = ["fecha", "codigo", "producto", "color", "talla", "precio", "descuento_pct", "descuento_monto", "total"]
+            cols = ["fecha", "codigo", "marca", "producto", "color", "talla", "precio", "descuento_pct", "descuento_monto", "total"]
             st.dataframe(vendidos_df[cols], use_container_width=True)
 
         if not pagos_df.empty:
@@ -798,7 +1016,7 @@ El archivo debe tener estas hojas:
 
         if not wishlist_df.empty:
             st.markdown("### Wish list")
-            st.dataframe(wishlist_df[["fecha", "codigo", "producto", "color", "talla", "precio"]], use_container_width=True)
+            st.dataframe(wishlist_df[["fecha", "codigo", "marca", "producto", "color", "talla", "precio"]], use_container_width=True)
 
         pdf = build_invoice_pdf(cliente, vendidos_df, wishlist_df, pagos_df)
         st.download_button(
@@ -902,6 +1120,7 @@ def show_product(row):
     with col2:
         st.write(f"**Código numérico:** {numero}")
         st.write(f"**Código interno:** {clean_text(row['codigo_interno'])}")
+        st.write(f"**Marca:** {clean_text(row.get('marca', ''))}")
         st.write(f"**Modelo:** {clean_text(row['codigo'])}")
         st.write(f"**Color:** {clean_text(row['color'])}")
         st.write(f"**Talla:** {display_talla(row['talla'])}")
@@ -983,7 +1202,7 @@ def photos_page(df):
     if q:
         row = find_product(df, q)
     else:
-        opts = [f"{normalize_numero(r.numero)} · {r.producto} · {r.color} · {display_talla(r.talla)}" for r in df.itertuples()]
+        opts = [f"{normalize_numero(r.numero)} · {getattr(r, 'marca', '')} · {r.producto} · {r.color} · {display_talla(r.talla)}" for r in df.itertuples()]
         selected = st.selectbox("O selecciona pieza", opts)
         idx = opts.index(selected)
         row = df.iloc[idx]
@@ -1014,13 +1233,16 @@ def photos_page(df):
 def catalog_page(df):
     st.title("Catálogo disponible")
     include_price = st.checkbox("Incluir precio", value=True)
+    group_by_brand = st.checkbox("Separar catálogo por marca", value=True)
     talla_filter = st.text_input("Filtrar por talla opcional", placeholder="Ej: T40")
     preview = df.copy()
+    if "marca" not in preview.columns:
+        preview["marca"] = ""
     if talla_filter.strip():
         preview = preview[preview["talla"].astype(str).str.upper().str.contains(talla_filter.strip().upper(), na=False)]
-    st.dataframe(preview[["numero", "producto", "color", "talla", "precio", "foto_url"]], use_container_width=True)
-    pdf = build_catalog_pdf(df, include_price=include_price, talla_filter=talla_filter)
-    st.download_button("Descargar catálogo PDF", pdf, file_name="catalogo_concherie.pdf", mime="application/pdf", use_container_width=True)
+    st.dataframe(preview[["numero", "marca", "producto", "color", "talla", "precio", "foto_url"]], use_container_width=True)
+    pdf = build_catalog_pdf(df, include_price=include_price, talla_filter=talla_filter, group_by_brand=group_by_brand)
+    st.download_button("Descargar catálogo PDF", pdf, file_name="catalogo_concherie_por_marca.pdf", mime="application/pdf", use_container_width=True)
 
 
 def qr_page(df):
@@ -1173,6 +1395,7 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
 
             expanded_rows.append({
                 "numero": numero,
+                "marca": clean_text(row.get("marca", "")) or clean_text(row.get("marca/maison", "")) or clean_text(row.get("maison", "")),
                 "codigo": codigo,
                 "producto": producto,
                 "color": color,
