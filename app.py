@@ -1,709 +1,458 @@
-import base64
-import io
-import os
-import re
-import unicodedata
-from datetime import datetime
-from typing import Optional, Tuple
-
-import cv2
-import numpy as np
-import pandas as pd
-import qrcode
-import requests
 import streamlit as st
-from PIL import Image, ImageOps
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import cm
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from streamlit_gsheets import GSheetsConnection
+import pandas as pd
+from datetime import datetime
+from io import BytesIO
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 
-# ============================================================
-# CONFIG
-# ============================================================
-st.set_page_config(page_title="Concherie", page_icon="🏷️", layout="wide")
+st.set_page_config(page_title="Concherie", layout="wide")
 
-USERS = {
-    "jc": {"password": "master", "role": "admin"},
-    "ventas": {"password": "moira", "role": "ventas"},
-    "info": {"password": "precio", "role": "info"},
-}
+st.title("Concherie")
+st.subheader("Generador de notas de venta")
 
-INVENTORY_SHEET = "inventario"
-REQUIRED_COLUMNS = [
-    "numero",
-    "codigo_interno",
-    "codigo",
-    "producto",
-    "color",
-    "talla",
-    "precio",
-    "foto_url",
-    "fecha_actualizacion",
-]
+# =========================================================
+# INVENTARIO DEMO
+# Reemplazar luego por Google Sheets / Supabase
+# =========================================================
 
-# ============================================================
-# HELPERS
-# ============================================================
-def clean_text(x):
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
+inventario_demo = pd.DataFrame([
+    {
+        "codigo": 1001,
+        "marca": "Zimmermann",
+        "descripcion": "Vestido floral",
+        "precio": 450,
+        "estado": "Disponible"
+    },
+    {
+        "codigo": 1002,
+        "marca": "Missoni",
+        "descripcion": "Top tejido",
+        "precio": 320,
+        "estado": "Disponible"
+    },
+    {
+        "codigo": 1003,
+        "marca": "Pucci",
+        "descripcion": "Pantalón estampado",
+        "precio": 390,
+        "estado": "Disponible"
+    },
+    {
+        "codigo": 1004,
+        "marca": "Zimmermann",
+        "descripcion": "Blusa seda",
+        "precio": 280,
+        "estado": "Reservada"
+    },
+])
 
-
-def slugify(text):
-    text = clean_text(text)
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^A-Za-z0-9_-]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("_")
-    return text or "archivo"
-
-
-def normalize_numero(value):
-    s = clean_text(value)
-    if not s:
-        return ""
-    try:
-        if re.fullmatch(r"\d+\.0", s):
-            s = str(int(float(s)))
-        elif re.fullmatch(r"\d+(\.\d+)?", s):
-            # 66 -> 066, 1 -> 001, 066 -> 066
-            s = str(int(float(s)))
-    except Exception:
-        pass
-    if s.isdigit():
-        return s.zfill(3)
-    m = re.search(r"(\d{1,3})$", s)
-    if m:
-        return m.group(1).zfill(3)
-    return s
+# =========================================================
+# FUNCIONES
+# =========================================================
 
 
-def display_talla(talla):
-    t = clean_text(talla)
-    if not t or t.upper() in ["T0", "0", "SIN TALLA", "NAN", "NONE"]:
-        return "Talla Única"
-    return t
+def buscar_pieza(codigo):
+    resultado = inventario_demo[inventario_demo["codigo"] == codigo]
 
-
-def money(v):
-    try:
-        return f"${float(v):,.2f}"
-    except Exception:
-        return "$0.00"
-
-
-def parse_price(v):
-    if pd.isna(v):
-        return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    s = str(v).replace("$", "").replace(",", "").strip()
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=REQUIRED_COLUMNS)
-    df = df.copy()
-    df.columns = [clean_text(c).lower().replace(" ", "_") for c in df.columns]
-    aliases = {
-        "marca/maison": "marca",
-        "maison": "marca",
-        "cod": "codigo",
-        "código": "codigo",
-        "codigo_modelo": "codigo",
-        "articulo": "producto",
-        "artículo": "producto",
-        "descripcion": "producto",
-        "descripción": "producto",
-        "colour": "color",
-        "size": "talla",
-        "price": "precio",
-        "photo": "foto_url",
-    }
-    df = df.rename(columns={c: aliases.get(c, c) for c in df.columns})
-
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = "" if col != "precio" else 0.0
-
-    df["numero"] = df.apply(lambda r: normalize_numero(r.get("numero")) or normalize_numero(r.get("codigo_interno")), axis=1)
-    df["codigo"] = df["codigo"].apply(clean_text).str.upper()
-    df["producto"] = df["producto"].apply(clean_text).str.upper()
-    df["color"] = df["color"].apply(clean_text).str.upper()
-    df["talla"] = df["talla"].apply(lambda x: display_talla(x))
-    df["precio"] = df["precio"].apply(parse_price)
-    df["foto_url"] = df["foto_url"].apply(clean_text)
-
-    def make_internal(r):
-        existing = clean_text(r.get("codigo_interno"))
-        if existing and existing.lower() not in ["nan", "none"]:
-            # Normalize ending only if needed
-            parts = existing.split("-")
-            if parts:
-                parts[-1] = normalize_numero(parts[-1])
-                return "-".join(parts).upper()
-        codigo = clean_text(r.get("codigo")).upper() or "SINCODIGO"
-        color = clean_text(r.get("color")).upper() or "SINCOLOR"
-        talla = clean_text(r.get("talla"))
-        talla_code = "T0" if talla == "Talla Única" else talla.upper()
-        numero = normalize_numero(r.get("numero"))
-        return f"{codigo}-{color}-{talla_code}-{numero}".upper()
-
-    df["codigo_interno"] = df.apply(make_internal, axis=1)
-    df["fecha_actualizacion"] = df["fecha_actualizacion"].apply(clean_text)
-
-    return df[REQUIRED_COLUMNS].sort_values("codigo_interno").reset_index(drop=True)
-
-
-# ============================================================
-# DATA
-# ============================================================
-def get_gsheets_conn():
-    return st.connection("gsheets", type=GSheetsConnection)
-
-
-def load_inventory() -> pd.DataFrame:
-    try:
-        conn = get_gsheets_conn()
-        df = conn.read(worksheet=INVENTORY_SHEET, ttl=0)
-        st.session_state.data_status = "Google Sheets"
-        return ensure_inventory_schema(df)
-    except Exception as e:
-        st.session_state.data_status = f"Local / error Sheets: {str(e)[:120]}"
-        if "inventario" not in st.session_state:
-            st.session_state.inventario = pd.DataFrame(columns=REQUIRED_COLUMNS)
-        return ensure_inventory_schema(st.session_state.inventario)
-
-
-def save_inventory(df: pd.DataFrame):
-    df = ensure_inventory_schema(df)
-    st.session_state.inventario = df
-    try:
-        conn = get_gsheets_conn()
-        conn.update(worksheet=INVENTORY_SHEET, data=df)
-        st.session_state.data_status = "Google Sheets"
-        return True, "Guardado en Google Sheets"
-    except Exception as e:
-        st.session_state.data_status = f"Local / error Sheets: {str(e)[:120]}"
-        return False, str(e)
-
-
-# ============================================================
-# SUPABASE STORAGE
-# ============================================================
-def supabase_configured():
-    return "supabase" in st.secrets and all(k in st.secrets["supabase"] for k in ["url", "key", "bucket"])
-
-
-def supabase_upload_bytes(data: bytes, path: str, content_type: str) -> Optional[str]:
-    if not supabase_configured():
+    if resultado.empty:
         return None
-    url = st.secrets["supabase"]["url"].rstrip("/")
-    key = st.secrets["supabase"]["key"]
-    bucket = st.secrets["supabase"]["bucket"]
-    api_url = f"{url}/storage/v1/object/{bucket}/{path}"
-    headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": content_type,
-        "x-upsert": "true",
-    }
-    r = requests.post(api_url, headers=headers, data=data, timeout=60)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Supabase error {r.status_code}: {r.text[:300]}")
-    return f"{url}/storage/v1/object/public/{bucket}/{path}"
+
+    return resultado.iloc[0]
 
 
-def compress_image(uploaded_file) -> Tuple[bytes, str]:
-    img = Image.open(uploaded_file)
-    img = ImageOps.exif_transpose(img)
-    img = img.convert("RGB")
-    img.thumbnail((1400, 1400))
-    out = io.BytesIO()
-    img.save(out, format="JPEG", quality=82, optimize=True)
-    return out.getvalue(), "image/jpeg"
 
+def generar_pdf(cliente, fecha_emision, vendidos_df, wishlist_df, pagos_df, total_pagado):
+    buffer = BytesIO()
 
-def upload_product_photo(uploaded_file, numero, producto):
-    data, content_type = compress_image(uploaded_file)
-    filename = f"{normalize_numero(numero)}_{slugify(producto)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-    path = f"productos/{filename}"
-    return supabase_upload_bytes(data, path, content_type)
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+    )
 
+    styles = getSampleStyleSheet()
+    elementos = []
 
-# ============================================================
-# QR / PDF
-# ============================================================
-def make_qr_image(payload: str, box_size=10):
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=box_size, border=2)
-    qr.add_data(payload)
-    qr.make(fit=True)
-    return qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    # =====================================================
+    # HEADER
+    # =====================================================
 
+    titulo = Paragraph(f"<b>CONCHERIE</b>", styles['Title'])
+    elementos.append(titulo)
+    elementos.append(Spacer(1, 0.2 * inch))
 
-def pil_to_reader(img):
-    b = io.BytesIO()
-    img.save(b, format="PNG")
-    b.seek(0)
-    return ImageReader(b)
+    cliente_text = Paragraph(f"<b>Cliente:</b> {cliente}", styles['BodyText'])
+    fecha_text = Paragraph(f"<b>Fecha:</b> {fecha_emision}", styles['BodyText'])
 
+    elementos.append(cliente_text)
+    elementos.append(fecha_text)
+    elementos.append(Spacer(1, 0.25 * inch))
 
-def build_labels_pdf(df: pd.DataFrame) -> bytes:
-    df = ensure_inventory_schema(df).sort_values("codigo_interno")
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    page_w, page_h = A4
+    # =====================================================
+    # PIEZAS VENDIDAS
+    # =====================================================
 
-    label_w = 8 * cm
-    label_h = 5 * cm
-    margin_x = (page_w - 2 * label_w) / 2
-    top_margin = 0.8 * cm
-    rows = 5
-    cols = 2
+    elementos.append(Paragraph("<b>Piezas vendidas</b>", styles['Heading2']))
+    elementos.append(Spacer(1, 0.12 * inch))
 
-    def draw_grid():
-        c.setDash(2, 3)
-        c.setStrokeColorRGB(0.45, 0.45, 0.45)
-        c.setLineWidth(0.6)
-        mid_x = margin_x + label_w
-        c.line(mid_x, top_margin, mid_x, page_h - top_margin)
-        for r in range(1, rows):
-            y = page_h - top_margin - r * label_h
-            c.line(margin_x, y, margin_x + 2 * label_w, y)
-        c.setDash()
+    mostrar_descuento = vendidos_df["descuento_pct"].fillna(0).sum() > 0
 
-    draw_grid()
-    idx = 0
-    for _, row in df.iterrows():
-        pos = idx % (rows * cols)
-        if idx > 0 and pos == 0:
-            c.showPage()
-            draw_grid()
-        col = pos % cols
-        rr = pos // cols
-        x = margin_x + col * label_w
-        y_top = page_h - top_margin - rr * label_h
-        y = y_top - label_h
-
-        numero = normalize_numero(row["numero"])
-        producto = clean_text(row["producto"])
-        color = clean_text(row["color"])
-        talla = display_talla(row["talla"])
-        interno = clean_text(row["codigo_interno"])
-
-        qr_img = make_qr_image(numero, box_size=8)
-        qr_size = 3.55 * cm
-        qr_x = x + 0.28 * cm
-        qr_y = y + 0.65 * cm
-        c.drawImage(pil_to_reader(qr_img), qr_x, qr_y, width=qr_size, height=qr_size, mask="auto")
-
-        tx = x + 4.15 * cm
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 24)
-        c.drawString(tx, y_top - 0.85 * cm, numero)
-
-        c.setFont("Helvetica-Bold", 7.2)
-        text_obj = c.beginText(tx, y_top - 1.35 * cm)
-        text_obj.setLeading(8)
-        # wrap product in max 2 lines
-        prod_words = producto.split()
-        lines = []
-        line = ""
-        for w in prod_words:
-            test = f"{line} {w}".strip()
-            if len(test) > 20 and line:
-                lines.append(line)
-                line = w
-            else:
-                line = test
-        if line:
-            lines.append(line)
-        for l in lines[:2]:
-            text_obj.textLine(l)
-        c.drawText(text_obj)
-
-        c.setFont("Helvetica", 7.5)
-        c.drawString(tx, y_top - 2.25 * cm, color[:22])
-        c.drawString(tx, y_top - 2.65 * cm, talla[:22])
-        c.setFont("Helvetica", 5.2)
-        c.drawRightString(x + label_w - 0.25 * cm, y + 0.25 * cm, interno[:38])
-        idx += 1
-
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="") -> bytes:
-    df = ensure_inventory_schema(df)
-    if talla_filter.strip():
-        tf = talla_filter.strip().upper()
-        df = df[df["talla"].astype(str).str.upper().str.contains(tf, na=False)]
-    df = df.sort_values(["producto", "color", "talla", "numero"])
-
-    buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
-    margin = 1.3 * cm
-    card_w = (w - 2 * margin - 0.7 * cm) / 2
-    card_h = 6.4 * cm
-    gap = 0.7 * cm
-
-    def header():
-        c.setFont("Helvetica-Bold", 20)
-        c.drawString(margin, h - margin, "CONCHERIE BOUTIQUE")
-        c.setFont("Helvetica", 10)
-        c.drawString(margin, h - margin - 0.45 * cm, "Catálogo disponible")
-
-    header()
-    y = h - margin - 1.3 * cm
-    col = 0
-
-    for _, row in df.iterrows():
-        if y - card_h < margin:
-            c.showPage()
-            header()
-            y = h - margin - 1.3 * cm
-            col = 0
-        x = margin + col * (card_w + gap)
-
-        c.setStrokeColorRGB(0.85, 0.85, 0.85)
-        c.roundRect(x, y - card_h, card_w, card_h, 8, stroke=1, fill=0)
-
-        # photo area
-        photo_url = clean_text(row.get("foto_url"))
-        if photo_url.startswith("http"):
-            try:
-                img_data = requests.get(photo_url, timeout=10).content
-                img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                img.thumbnail((500, 500))
-                c.drawImage(pil_to_reader(img), x + 0.3 * cm, y - 3.6 * cm, width=2.9 * cm, height=2.9 * cm, preserveAspectRatio=True, anchor="c")
-            except Exception:
-                c.setFillColorRGB(0.95, 0.95, 0.95)
-                c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
-        else:
-            c.setFillColorRGB(0.96, 0.96, 0.96)
-            c.rect(x + 0.3 * cm, y - 3.6 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
-            c.setFont("Helvetica", 8)
-            c.drawCentredString(x + 1.75 * cm, y - 2.15 * cm, "Sin foto")
-
-        tx = x + 3.55 * cm
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 9.5)
-        c.drawString(tx, y - 0.7 * cm, f"{normalize_numero(row['numero'])} · {clean_text(row['producto'])[:24]}")
-        c.setFont("Helvetica-Oblique", 8)
-        c.drawString(tx, y - 1.2 * cm, f"{clean_text(row['color'])} · {display_talla(row['talla'])}")
-        c.setFont("Helvetica", 7)
-        c.drawString(tx, y - 1.7 * cm, clean_text(row["codigo_interno"])[:30])
-        if include_price:
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(tx, y - 2.55 * cm, money(row["precio"]))
-        col += 1
-        if col == 2:
-            col = 0
-            y -= card_h + 0.55 * cm
-
-    c.save()
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# ============================================================
-# AUTH / NAV
-# ============================================================
-def login():
-    st.title("Concherie")
-    u = st.text_input("Usuario")
-    p = st.text_input("Clave", type="password")
-    if st.button("Entrar", use_container_width=True):
-        if u in USERS and USERS[u]["password"] == p:
-            st.session_state.user = u
-            st.session_state.role = USERS[u]["role"]
-            st.session_state.page = "inicio"
-            st.rerun()
-        else:
-            st.error("Usuario o clave incorrecta")
-
-
-def can_admin():
-    return st.session_state.get("role") == "admin"
-
-
-def can_ventas():
-    return st.session_state.get("role") in ["admin", "ventas"]
-
-
-def set_page(p):
-    st.session_state.page = p
-    st.rerun()
-
-
-def sidebar():
-    st.sidebar.title("Concherie")
-    st.sidebar.write(f"Usuario: **{st.session_state.get('user')}**")
-    st.sidebar.success(f"Datos: {st.session_state.get('data_status', 'Google Sheets')}")
-    if supabase_configured():
-        st.sidebar.success("Fotos: Supabase")
+    if mostrar_descuento:
+        data = [[
+            "Fecha",
+            "Código",
+            "Marca",
+            "Descripción",
+            "Precio",
+            "Desc.",
+            "Total"
+        ]]
     else:
-        st.sidebar.warning("Fotos: Supabase no configurado")
+        data = [[
+            "Fecha",
+            "Código",
+            "Marca",
+            "Descripción",
+            "Total"
+        ]]
 
-    buttons = [("🏠 Inicio", "inicio"), ("🔎 Buscar código", "buscar"), ("◼ Escanear QR", "scan")]
-    if can_ventas():
-        buttons += [("📸 Fotos", "fotos"), ("📄 Catálogo", "catalogo")]
-    if can_admin():
-        buttons += [("📥 Cargar inventario", "cargar"), ("🏷️ Generar QR", "qr"), ("📦 Inventario", "inventario"), ("⚙️ Admin", "admin")]
+    subtotal = 0
+    descuento_total = 0
 
-    st.sidebar.divider()
-    for label, page in buttons:
-        if st.sidebar.button(label, use_container_width=True):
-            set_page(page)
-    st.sidebar.divider()
-    if st.sidebar.button("Cerrar sesión", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
+    for _, row in vendidos_df.iterrows():
+        subtotal += row["precio"]
+        descuento_total += row["descuento_monto"]
 
-
-# ============================================================
-# PRODUCT DISPLAY
-# ============================================================
-def find_product(df, query):
-    q = normalize_numero(query)
-    if not q:
-        return None
-    matches = df[df["numero"].astype(str).apply(normalize_numero) == q]
-    if matches.empty:
-        # also allow internal code search
-        qq = clean_text(query).upper()
-        matches = df[df["codigo_interno"].astype(str).str.upper().str.contains(qq, na=False)]
-    if matches.empty:
-        return None
-    return matches.iloc[0]
-
-
-def show_product(row):
-    numero = normalize_numero(row["numero"])
-    st.subheader(f"{numero} · {clean_text(row['producto'])}")
-    col1, col2, col3 = st.columns([1.1, 1.4, 0.9])
-    with col1:
-        url = clean_text(row.get("foto_url"))
-        if url.startswith("http"):
-            st.image(url, use_container_width=True)
+        if mostrar_descuento:
+            data.append([
+                row["fecha"],
+                str(row["codigo"]),
+                row["marca"],
+                row["descripcion"],
+                f"${row['precio']:,.2f}",
+                row["descuento_display"],
+                f"${row['total']:,.2f}"
+            ])
         else:
-            st.info("Sin foto")
-    with col2:
-        st.write(f"**Código numérico:** {numero}")
-        st.write(f"**Código interno:** {clean_text(row['codigo_interno'])}")
-        st.write(f"**Modelo:** {clean_text(row['codigo'])}")
-        st.write(f"**Color:** {clean_text(row['color'])}")
-        st.write(f"**Talla:** {display_talla(row['talla'])}")
-    with col3:
-        st.metric("Precio", money(row["precio"]))
+            data.append([
+                row["fecha"],
+                str(row["codigo"]),
+                row["marca"],
+                row["descripcion"],
+                f"${row['total']:,.2f}"
+            ])
+
+    tabla = Table(data, repeatRows=1)
+
+    tabla.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.black),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+        ('TOPPADDING', (0, 0), (-1, 0), 10),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.whitesmoke),
+    ]))
+
+    elementos.append(tabla)
+    elementos.append(Spacer(1, 0.25 * inch))
+
+    total_final = subtotal - descuento_total
+    saldo_pendiente = total_final - total_pagado
+
+    resumen = [
+        ["Subtotal", f"${subtotal:,.2f}"],
+    ]
+
+    if descuento_total > 0:
+        resumen.append(["Descuento total", f"-${descuento_total:,.2f}"])
+
+    resumen.extend([
+        ["Total vendido", f"${total_final:,.2f}"],
+        ["Pagado a la fecha", f"${total_pagado:,.2f}"],
+        ["Saldo pendiente", f"${saldo_pendiente:,.2f}"]
+    ])
+
+    tabla_resumen = Table(resumen, colWidths=[3 * inch, 2 * inch])
+
+    tabla_resumen.setStyle(TableStyle([
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.beige),
+    ]))
+
+    elementos.append(tabla_resumen)
+    elementos.append(Spacer(1, 0.35 * inch))
+
+    # =====================================================
+    # PAGOS
+    # =====================================================
+
+    if not pagos_df.empty:
+        elementos.append(Paragraph("<b>Pagos registrados</b>", styles['Heading2']))
+        elementos.append(Spacer(1, 0.12 * inch))
+
+        pagos_data = [["Fecha", "Forma de pago", "Monto"]]
+
+        for _, row in pagos_df.iterrows():
+            pagos_data.append([
+                row["fecha_pago"],
+                row["forma_pago"],
+                f"${row['monto_pago']:,.2f}"
+            ])
+
+        pagos_table = Table(pagos_data)
+
+        pagos_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.darkgrey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ]))
+
+        elementos.append(pagos_table)
+        elementos.append(Spacer(1, 0.35 * inch))
+
+    # =====================================================
+    # WISH LIST
+    # =====================================================
+
+    if not wishlist_df.empty:
+        elementos.append(Paragraph("<b>Wish List / Piezas reservadas</b>", styles['Heading2']))
+        elementos.append(Spacer(1, 0.12 * inch))
+
+        wishlist_data = [[
+            "Fecha",
+            "Código",
+            "Marca",
+            "Descripción",
+            "Precio"
+        ]]
+
+        for _, row in wishlist_df.iterrows():
+            wishlist_data.append([
+                row["fecha"],
+                str(row["codigo"]),
+                row["marca"],
+                row["descripcion"],
+                f"${row['precio']:,.2f}"
+            ])
+
+        wishlist_table = Table(wishlist_data)
+
+        wishlist_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#D7C7A3')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#F7F1E7')),
+        ]))
+
+        elementos.append(wishlist_table)
+        elementos.append(Spacer(1, 0.18 * inch))
+
+        nota = Paragraph(
+            "Las piezas incluidas en el wish list se mantienen temporalmente reservadas para la cliente. "
+            "Agradecemos confirmar la decisión dentro de un tiempo prudencial, para que en caso de no continuar "
+            "con la compra puedan volver a estar disponibles para la venta.",
+            styles['Italic']
+        )
+
+        elementos.append(nota)
+
+    doc.build(elementos)
+
+    pdf = buffer.getvalue()
+    buffer.close()
+
+    return pdf
 
 
-# ============================================================
-# PAGES
-# ============================================================
-def home_page(df):
-    st.title("Concherie Boutique")
-    st.caption("Inventario, QR, fotos y catálogo.")
-    cols = st.columns(3 if can_admin() else 2)
-    with cols[0]:
-        if st.button("◼ Escanear QR", use_container_width=True): set_page("scan")
-        if st.button("🔎 Buscar código", use_container_width=True): set_page("buscar")
-    with cols[1]:
-        if can_ventas() and st.button("📸 Fotos", use_container_width=True): set_page("fotos")
-        if can_ventas() and st.button("📄 Catálogo", use_container_width=True): set_page("catalogo")
-    if can_admin():
-        with cols[2]:
-            if st.button("🏷️ Generar QR", use_container_width=True): set_page("qr")
-            if st.button("📥 Cargar inventario", use_container_width=True): set_page("cargar")
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total piezas", len(df))
-    c2.metric("Con foto", int(df["foto_url"].astype(str).str.startswith("http").sum()) if not df.empty else 0)
-    c3.metric("Sin foto", int((~df["foto_url"].astype(str).str.startswith("http")).sum()) if not df.empty else 0)
+# =========================================================
+# UI
+# =========================================================
 
+st.markdown("---")
 
-def search_page(df):
-    st.title("Buscar código")
-    q = st.text_input("Código numérico", placeholder="Ej: 066")
-    if q:
-        row = find_product(df, q)
-        if row is None:
-            st.error("No encontré esa pieza.")
-        else:
-            show_product(row)
+st.header("Subir Excel de cliente")
 
+st.info(
+    "El Excel puede contener piezas vendidas, wish list y pagos registrados. "
+    "La app generará automáticamente una nota de venta en PDF."
+)
 
-def scan_page(df):
-    st.title("Escanear QR")
-    st.info("En iPhone, usa la cámara normal para leer el QR. Si prefieres, toma/sube una foto del QR aquí o escribe el código manualmente.")
-    manual = st.text_input("Código manual", placeholder="Ej: 066")
-    if manual:
-        row = find_product(df, manual)
-        if row is not None:
-            show_product(row)
-        else:
-            st.error("No encontré esa pieza.")
-        return
-    uploaded = st.file_uploader("Subir foto del QR", type=["jpg", "jpeg", "png"])
-    if uploaded:
-        file_bytes = np.asarray(bytearray(uploaded.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        detector = cv2.QRCodeDetector()
-        data, bbox, _ = detector.detectAndDecode(img)
-        if data:
-            st.success(f"QR leído: {data}")
-            row = find_product(df, data)
-            if row is not None:
-                show_product(row)
-            else:
-                st.error("El QR se leyó, pero no encontré la pieza.")
-        else:
-            st.error("No pude leer el QR. Escribe el código numérico manualmente.")
+archivo = st.file_uploader(
+    "Excel cliente",
+    type=["xlsx", "xls"]
+)
 
+# =========================================================
+# FORMATO ESPERADO
+# =========================================================
 
-def photos_page(df):
-    st.title("Fotos de productos")
-    if df.empty:
-        st.info("No hay inventario.")
-        return
-    q = st.text_input("Buscar pieza por código", placeholder="Ej: 066")
-    row = None
-    if q:
-        row = find_product(df, q)
-    else:
-        opts = [f"{normalize_numero(r.numero)} · {r.producto} · {r.color} · {display_talla(r.talla)}" for r in df.itertuples()]
-        selected = st.selectbox("O selecciona pieza", opts)
-        idx = opts.index(selected)
-        row = df.iloc[idx]
-    if row is None:
-        st.warning("No encontré esa pieza.")
-        return
-    show_product(row)
-    st.divider()
-    uploaded = st.file_uploader("Agregar / cambiar foto", type=["jpg", "jpeg", "png", "heic", "heif"])
-    if uploaded and st.button("Guardar foto", type="primary"):
+with st.expander("Formato esperado del Excel"):
+    st.markdown("""
+### Hoja: VENDIDOS
+
+| fecha | codigo | descuento_pct |
+|---|---|---|
+| 07/05/2026 | 1001 | |
+| 07/05/2026 | 1002 | 10 |
+
+---
+
+### Hoja: WISHLIST
+
+| fecha | codigo |
+|---|---|
+| 07/05/2026 | 1004 |
+
+---
+
+### Hoja: PAGOS
+
+| fecha_pago | forma_pago | monto_pago |
+|---|---|---|
+| 07/05/2026 | Zelle | 200 |
+
+---
+
+### Hoja: CLIENTE
+
+| cliente |
+|---|
+| María Pérez |
+""")
+
+# =========================================================
+# PROCESAMIENTO
+# =========================================================
+
+if archivo:
+    try:
+        cliente_df = pd.read_excel(archivo, sheet_name="CLIENTE")
+        vendidos_excel = pd.read_excel(archivo, sheet_name="VENDIDOS")
+
         try:
-            url = upload_product_photo(uploaded, row["numero"], row["producto"])
-            if not url:
-                st.error("Supabase no está configurado.")
-                return
-            df.loc[df["numero"].astype(str).apply(normalize_numero) == normalize_numero(row["numero"]), "foto_url"] = url
-            df["fecha_actualizacion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            ok, msg = save_inventory(df)
-            if ok:
-                st.success("Foto guardada correctamente.")
-                st.rerun()
-            else:
-                st.error(f"La foto subió, pero no pude guardar el link en Sheets: {msg}")
-        except Exception as e:
-            st.error(f"No pude guardar la foto: {e}")
+            wishlist_excel = pd.read_excel(archivo, sheet_name="WISHLIST")
+        except:
+            wishlist_excel = pd.DataFrame()
 
+        try:
+            pagos_excel = pd.read_excel(archivo, sheet_name="PAGOS")
+        except:
+            pagos_excel = pd.DataFrame()
 
-def catalog_page(df):
-    st.title("Catálogo disponible")
-    include_price = st.checkbox("Incluir precio", value=True)
-    talla_filter = st.text_input("Filtrar por talla opcional", placeholder="Ej: T40")
-    preview = df.copy()
-    if talla_filter.strip():
-        preview = preview[preview["talla"].astype(str).str.upper().str.contains(talla_filter.strip().upper(), na=False)]
-    st.dataframe(preview[["numero", "producto", "color", "talla", "precio", "foto_url"]], use_container_width=True)
-    pdf = build_catalog_pdf(df, include_price=include_price, talla_filter=talla_filter)
-    st.download_button("Descargar catálogo PDF", pdf, file_name="catalogo_concherie.pdf", mime="application/pdf", use_container_width=True)
+        cliente = cliente_df.iloc[0]["cliente"]
 
+        vendidos_procesados = []
+        wishlist_procesados = []
 
-def qr_page(df):
-    st.title("Generar QR / etiquetas")
-    st.caption("Formato 5x8 cm, QR grande, código numérico grande y líneas punteadas comunes para guillotina.")
-    pdf = build_labels_pdf(df)
-    st.download_button("Descargar etiquetas PDF", pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
+        # =================================================
+        # VENDIDOS
+        # =================================================
 
+        for _, row in vendidos_excel.iterrows():
+            pieza = buscar_pieza(int(row["codigo"]))
 
-def inventory_page(df):
-    st.title("Inventario")
-    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
-    if st.button("Guardar cambios", type="primary"):
-        ok, msg = save_inventory(edited)
-        if ok:
-            st.success("Inventario guardado.")
+            if pieza is None:
+                st.warning(f"Código no encontrado: {row['codigo']}")
+                continue
+
+            descuento_pct = row.get("descuento_pct", 0)
+
+            if pd.isna(descuento_pct):
+                descuento_pct = 0
+
+            descuento_monto = pieza["precio"] * (descuento_pct / 100)
+            total = pieza["precio"] - descuento_monto
+
+            vendidos_procesados.append({
+                "fecha": row["fecha"],
+                "codigo": pieza["codigo"],
+                "marca": pieza["marca"],
+                "descripcion": pieza["descripcion"],
+                "precio": pieza["precio"],
+                "descuento_pct": descuento_pct,
+                "descuento_monto": descuento_monto,
+                "descuento_display": (
+                    f"{descuento_pct:.0f}% / ${descuento_monto:,.2f}"
+                    if descuento_pct > 0 else ""
+                ),
+                "total": total
+            })
+
+        vendidos_df = pd.DataFrame(vendidos_procesados)
+
+        # =================================================
+        # WISHLIST
+        # =================================================
+
+        if not wishlist_excel.empty:
+            for _, row in wishlist_excel.iterrows():
+                pieza = buscar_pieza(int(row["codigo"]))
+
+                if pieza is None:
+                    continue
+
+                wishlist_procesados.append({
+                    "fecha": row["fecha"],
+                    "codigo": pieza["codigo"],
+                    "marca": pieza["marca"],
+                    "descripcion": pieza["descripcion"],
+                    "precio": pieza["precio"]
+                })
+
+        wishlist_df = pd.DataFrame(wishlist_procesados)
+
+        # =================================================
+        # PAGOS
+        # =================================================
+
+        if pagos_excel.empty:
+            total_pagado = 0
         else:
-            st.error(msg)
+            total_pagado = pagos_excel["monto_pago"].sum()
 
+        fecha_emision = datetime.now().strftime("%d/%m/%Y")
 
-def cargar_page(df):
-    st.title("Cargar inventario")
-    st.warning("Esto reemplaza el inventario actual. Usa solo si vas a recargar desde Excel.")
-    uploaded = st.file_uploader("Excel inventario", type=["xlsx", "xls"])
-    if uploaded:
-        new = pd.read_excel(uploaded)
-        new = ensure_inventory_schema(new)
-        st.dataframe(new, use_container_width=True)
-        confirm = st.text_input("Para reemplazar inventario escribe CARGAR")
-        if st.button("Guardar inventario", type="primary"):
-            if confirm == "CARGAR":
-                ok, msg = save_inventory(new)
-                if ok:
-                    st.success("Inventario cargado.")
-                    st.rerun()
-                else:
-                    st.error(msg)
-            else:
-                st.error("Confirmación incorrecta.")
+        st.success("Nota procesada correctamente")
 
+        st.subheader(cliente)
 
-def admin_page(df):
-    st.title("Admin")
-    st.subheader("Limpiar fotos")
-    q = st.text_input("Código de pieza", placeholder="Ej: 066")
-    if q:
-        row = find_product(df, q)
-        if row is not None:
-            show_product(row)
-            confirm = st.text_input("Para borrar la foto, escribe el código numérico")
-            pwd = st.text_input("Clave admin", type="password")
-            if st.button("Borrar foto", type="primary"):
-                if confirm == normalize_numero(row["numero"]) and pwd == USERS["jc"]["password"]:
-                    df.loc[df["numero"].astype(str).apply(normalize_numero) == normalize_numero(row["numero"]), "foto_url"] = ""
-                    ok, msg = save_inventory(df)
-                    if ok:
-                        st.success("Foto borrada.")
-                        st.rerun()
-                    else:
-                        st.error(msg)
-                else:
-                    st.error("Confirmación o clave incorrecta.")
-        else:
-            st.error("No encontré esa pieza.")
+        if not vendidos_df.empty:
+            st.markdown("### Piezas vendidas")
+            st.dataframe(vendidos_df)
 
-# ============================================================
-# MAIN
-# ============================================================
-def main():
-    if "user" not in st.session_state:
-        login()
-        return
-    df = load_inventory()
-    sidebar()
-    page = st.session_state.get("page", "inicio")
-    if page == "inicio": home_page(df)
-    elif page == "buscar": search_page(df)
-    elif page == "scan": scan_page(df)
-    elif page == "fotos" and can_ventas(): photos_page(df)
-    elif page == "catalogo" and can_ventas(): catalog_page(df)
-    elif page == "qr" and can_admin(): qr_page(df)
-    elif page == "inventario" and can_admin(): inventory_page(df)
-    elif page == "cargar" and can_admin(): cargar_page(df)
-    elif page == "admin" and can_admin(): admin_page(df)
-    else:
-        st.warning("No tienes permiso para esta sección.")
+        if not wishlist_df.empty:
+            st.markdown("### Wish list")
+            st.dataframe(wishlist_df)
 
-if __name__ == "__main__":
-    main()
+        if not pagos_excel.empty:
+            st.markdown("### Pagos")
+            st.dataframe(pagos_excel)
+
+        pdf = generar_pdf(
+            cliente,
+            fecha_emision,
+            vendidos_df,
+            wishlist_df,
+            pagos_excel,
+            total_pagado
+        )
+
+        st.download_button(
+            label="Descargar PDF",
+            data=pdf,
+            file_name=f"nota_{cliente.replace(' ', '_')}.pdf",
+            mime="application/pdf"
+        )
+
+    except Exception as e:
+        st.error(f"Error procesando el archivo: {e}")
