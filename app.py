@@ -1247,6 +1247,10 @@ def photos_page(df):
 
 def catalog_page(df):
     st.title("Catálogo disponible")
+    if "marca" in df.columns:
+        sin_marca_count = int(df["marca"].astype(str).str.strip().isin(["", "SIN MARCA", "nan", "None"]).sum())
+        if sin_marca_count > 0:
+            st.warning(f"Hay {sin_marca_count} piezas sin marca. Ve a Admin > Reparar marcas o vuelve a cargar los Excels originales para rellenarlas.")
     include_price = st.checkbox("Incluir precio", value=True)
     group_by_brand = st.checkbox("Separar catálogo por marca", value=True)
     talla_filter = st.text_input("Filtrar por talla opcional", placeholder="Ej: T40")
@@ -1285,32 +1289,49 @@ def append_inventory(existing_df: pd.DataFrame, new_df: pd.DataFrame):
 
     if existing_df.empty:
         combined = new_df.copy()
-        return ensure_inventory_schema(combined), [], len(new_df)
+        return ensure_inventory_schema(combined), [], len(new_df), 0
 
     existing_codes = set(existing_df["codigo_interno"].astype(str).str.upper())
     existing_nums = set(existing_df["numero"].astype(str).apply(normalize_numero))
 
     rows_to_add = []
     skipped = []
+    brand_updates = 0
 
     for _, row in new_df.iterrows():
         codigo_interno = clean_text(row.get("codigo_interno")).upper()
         numero = normalize_numero(row.get("numero"))
+        new_brand = clean_text(row.get("marca", "")).upper()
 
         duplicated = False
         reason = ""
 
+        match_mask = pd.Series([False] * len(existing_df))
+
         if codigo_interno and codigo_interno in existing_codes:
             duplicated = True
             reason = f"código interno ya existe: {codigo_interno}"
+            match_mask = existing_df["codigo_interno"].astype(str).str.upper() == codigo_interno
         elif numero and numero in existing_nums:
             duplicated = True
             reason = f"número ya existe: {numero}"
+            match_mask = existing_df["numero"].astype(str).apply(normalize_numero) == numero
 
         if duplicated:
+            # Antes solo omitía duplicados. Ahora, si la pieza ya existe pero no tiene marca,
+            # rellena la marca sin tocar precio, código, foto ni demás campos.
+            if new_brand:
+                matched_indexes = existing_df.index[match_mask].tolist()
+                for ix in matched_indexes:
+                    current_brand = clean_text(existing_df.at[ix, "marca"]).upper()
+                    if current_brand in ["", "SIN MARCA", "NAN", "NONE"]:
+                        existing_df.at[ix, "marca"] = new_brand
+                        brand_updates += 1
+
             skipped.append({
                 "numero": numero,
                 "codigo_interno": codigo_interno,
+                "marca_detectada": new_brand,
                 "motivo": reason,
             })
         else:
@@ -1324,9 +1345,7 @@ def append_inventory(existing_df: pd.DataFrame, new_df: pd.DataFrame):
     else:
         combined = existing_df.copy()
 
-    return ensure_inventory_schema(combined), skipped, len(rows_to_add)
-
-
+    return ensure_inventory_schema(combined), skipped, len(rows_to_add), brand_updates
 
 def next_inventory_numbers(existing_df: pd.DataFrame, count: int):
     existing_df = ensure_inventory_schema(existing_df)
@@ -1522,14 +1541,27 @@ def repair_inventory_brands(df: pd.DataFrame, uploaded_files):
     updates = 0
 
     for idx, row in repaired.iterrows():
-        current_brand = clean_text(row.get("marca", ""))
+        current_brand = clean_text(row.get("marca", "")).upper()
         codigo = clean_text(row.get("codigo", "")).upper()
+        codigo_interno = clean_text(row.get("codigo_interno", "")).upper()
 
-        if current_brand and current_brand.upper() not in ["SIN MARCA", "NAN", "NONE"]:
+        if current_brand and current_brand not in ["SIN MARCA", "NAN", "NONE"]:
             continue
 
+        detected = ""
+
+        # 1) Match exact model code column
         if codigo in combined_map:
-            repaired.at[idx, "marca"] = combined_map[codigo]
+            detected = combined_map[codigo]
+
+        # 2) Match internal code prefix, e.g. S26C629-BLACK-T0-198 -> S26C629
+        if not detected and codigo_interno:
+            prefix = codigo_interno.split("-")[0].upper()
+            if prefix in combined_map:
+                detected = combined_map[prefix]
+
+        if detected:
+            repaired.at[idx, "marca"] = detected
             updates += 1
 
     return ensure_inventory_schema(repaired), updates, combined_map
@@ -1558,20 +1590,21 @@ def cargar_page(df):
             st.dataframe(new, use_container_width=True)
             st.caption("Si el Excel venía por modelo con cantidad, aquí ya aparece expandido a una línea por pieza, con números únicos asignados automáticamente.")
 
-            combined, skipped, added_count = append_inventory(df, new)
+            combined, skipped, added_count, brand_updates = append_inventory(df, new)
 
-            c1, c2 = st.columns(2)
+            c1, c2, c3 = st.columns(3)
             c1.metric("Piezas nuevas a agregar", added_count)
             c2.metric("Duplicadas / omitidas", len(skipped))
+            c3.metric("Marcas a reparar", brand_updates)
 
             if skipped:
-                st.warning("Estas piezas ya existen y no se agregarán nuevamente:")
+                st.warning("Estas piezas ya existen y no se agregarán nuevamente. Si tenían la marca vacía, la app sí la rellenará:")
                 st.dataframe(pd.DataFrame(skipped), use_container_width=True)
 
             if st.button("Agregar al inventario", type="primary", use_container_width=True):
                 ok, msg = save_inventory(combined)
                 if ok:
-                    st.success(f"Mercancía agregada correctamente. Se agregaron {added_count} piezas nuevas.")
+                    st.success(f"Mercancía procesada correctamente. Se agregaron {added_count} piezas nuevas y se repararon {brand_updates} marcas.")
                     st.rerun()
                 else:
                     st.error(msg)
@@ -1626,7 +1659,7 @@ def reparar_marcas_page(df):
     st.title("Reparar marcas del inventario")
     st.info(
         "Usa esta opción si el inventario ya fue cargado antes y aparece como SIN MARCA. "
-        "Sube los Excels originales de transcripción; la app usará el código/modelo para rellenar la marca."
+        "Sube los Excels originales de transcripción; la app usará el código/modelo para rellenar solo la columna marca, sin tocar precios, fotos ni números."
     )
 
     uploaded_files = st.file_uploader(
