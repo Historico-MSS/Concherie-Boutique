@@ -1090,6 +1090,101 @@ def append_inventory(existing_df: pd.DataFrame, new_df: pd.DataFrame):
     return ensure_inventory_schema(combined), skipped, len(rows_to_add)
 
 
+
+def next_inventory_numbers(existing_df: pd.DataFrame, count: int):
+    existing_df = ensure_inventory_schema(existing_df)
+    used = set(existing_df["numero"].astype(str).apply(normalize_numero))
+    max_num = 0
+    for n in used:
+        if clean_text(n).isdigit():
+            max_num = max(max_num, int(n))
+    nums = []
+    candidate = max_num + 1
+    while len(nums) < count:
+        n = str(candidate).zfill(3)
+        if n not in used:
+            nums.append(n)
+            used.add(n)
+        candidate += 1
+    return nums
+
+
+def infer_color_from_producto(producto):
+    p = clean_text(producto).upper()
+    known_colors = [
+        "NEGRO", "NEGRA", "BLACK", "SKIN", "AZUL", "BLUE", "ORQUIDEA", "MEADOW",
+        "SULPHUR", "BLANCO", "BLANCA", "WHITE", "ROJO", "ROJA", "RED", "VERDE",
+        "GREEN", "BEIGE", "CREMA", "CREAM", "DORADO", "GOLD", "PLATA", "SILVER",
+        "MARRON", "BROWN", "CAMEL", "NAVY", "FUCSIA", "PINK", "ROSA"
+    ]
+    found = [color for color in known_colors if re.search(rf"\b{re.escape(color)}\b", p)]
+    return " ".join(found[:2])
+
+
+def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Si el Excel ya trae numero/codigo_interno, respeta ese formato.
+    Si es una transcripción por modelo con cantidad/llegaron, expande cada línea a piezas individuales
+    y asigna números únicos consecutivos.
+    """
+    raw = raw_df.copy()
+    raw.columns = [clean_text(c).lower().replace(" ", "_") for c in raw.columns]
+
+    has_piece_codes = "numero" in raw.columns or "codigo_interno" in raw.columns
+
+    quantity_col = None
+    for candidate in ["llegaron", "cantidad", "qty"]:
+        if candidate in raw.columns:
+            quantity_col = candidate
+            break
+
+    if has_piece_codes:
+        return ensure_inventory_schema(raw)
+
+    if not quantity_col:
+        return ensure_inventory_schema(raw)
+
+    total_pieces = 0
+    quantities = []
+    for _, row in raw.iterrows():
+        q = row.get(quantity_col, 1)
+        try:
+            q = int(float(q))
+        except Exception:
+            q = 1
+        q = max(q, 0)
+        quantities.append(q)
+        total_pieces += q
+
+    generated_numbers = next_inventory_numbers(existing_df, total_pieces)
+    number_idx = 0
+
+    expanded_rows = []
+    for idx, row in raw.iterrows():
+        q = quantities[idx]
+        for _ in range(q):
+            numero = generated_numbers[number_idx]
+            number_idx += 1
+
+            producto = clean_text(row.get("producto", ""))
+            codigo = clean_text(row.get("codigo", ""))
+            color = clean_text(row.get("color", "")) or infer_color_from_producto(producto)
+            talla = clean_text(row.get("talla", ""))
+
+            expanded_rows.append({
+                "numero": numero,
+                "codigo": codigo,
+                "producto": producto,
+                "color": color,
+                "talla": talla,
+                "precio": row.get("precio", 0),
+                "foto_url": row.get("foto_url", ""),
+                "fecha_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+    return ensure_inventory_schema(pd.DataFrame(expanded_rows))
+
+
 def cargar_page(df):
     st.title("Cargar inventario")
 
@@ -1107,11 +1202,12 @@ def cargar_page(df):
         uploaded = st.file_uploader("Excel con mercancía nueva", type=["xlsx", "xls"], key="append_inventory_file")
 
         if uploaded:
-            new = pd.read_excel(uploaded)
-            new = ensure_inventory_schema(new)
+            raw_new = pd.read_excel(uploaded)
+            new = prepare_new_merchandise_upload(raw_new, df)
 
             st.markdown("### Vista previa de mercancía nueva")
             st.dataframe(new, use_container_width=True)
+            st.caption("Si el Excel venía por modelo con cantidad, aquí ya aparece expandido a una línea por pieza, con números únicos asignados automáticamente.")
 
             combined, skipped, added_count = append_inventory(df, new)
 
@@ -1201,4 +1297,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
