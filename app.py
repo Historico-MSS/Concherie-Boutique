@@ -567,9 +567,9 @@ def read_single_sheet_invoice(uploaded_file, sheet_name):
         if "vendido" in labels or "apartado" in labels or "wishlist" in labels or "wish_list" in labels:
             piezas_header_row = r
             for c, label in enumerate(labels):
-                if label in ["vendido", "vendidos", "codigo_vendido", "pieza_vendida"]:
+                if label in ["vendido", "vendidos", "codigo_vendido", "pieza_vendida", "codigo"]:
                     header_map["vendido"] = c
-                elif label in ["descuento", "descuento_pct", "desc"]:
+                elif label in ["descuento", "descuento_pct", "desc", "descuento_%"]:
                     header_map["descuento_pct"] = c
                 elif label in ["apartado", "wishlist", "wish_list", "reservado", "reservada"]:
                     header_map["apartado"] = c
@@ -589,6 +589,8 @@ def read_single_sheet_invoice(uploaded_file, sheet_name):
 
             descuento = raw.iat[r, header_map["descuento_pct"]] if "descuento_pct" in header_map else ""
             fecha = raw.iat[r, header_map["fecha"]] if "fecha" in header_map else datetime.now().strftime("%d/%m/%Y")
+            if clean_text(fecha) == "":
+                fecha = datetime.now().strftime("%d/%m/%Y")
 
             if clean_text(vendido):
                 vendidos_rows.append({
