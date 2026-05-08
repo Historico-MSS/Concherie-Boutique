@@ -1379,15 +1379,20 @@ def infer_color_from_producto(producto):
 
 def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Acepta dos formatos:
-    1) Inventario ya individualizado con numero/codigo_interno.
-    2) Transcripción por modelo con marca, codigo, producto, precio, cantidad/llegaron/llegó/pedido
-       y tallas en columnas Tallas, Tallas2, Tallas3...
+    Acepta:
+    1) Inventario individualizado con numero/codigo_interno.
+    2) Transcripción por modelo con marca, producto, precio, cantidad/llegaron
+       y tallas en columnas Tallas, Tallas2, etc.
+
+    También ignora automáticamente:
+    - filas TOTAL
+    - subtotales
+    - filas vacías
+    - líneas con precio 0 y sin código real
     """
     raw = raw_df.copy()
     raw.columns = [normalize_col_name(c) for c in raw.columns]
 
-    # Alias comunes
     aliases = {
         "marca_maison": "marca",
         "maison": "marca",
@@ -1405,7 +1410,22 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
 
     has_piece_codes = "numero" in raw.columns or "codigo_interno" in raw.columns
     if has_piece_codes:
-        return ensure_inventory_schema(raw)
+        cleaned = ensure_inventory_schema(raw)
+
+        # eliminar basura/totales
+        cleaned = cleaned[
+            ~(
+                cleaned["producto"].astype(str).str.upper().str.contains("TOTAL|SUBTOTAL", na=False)
+                |
+                (
+                    (cleaned["codigo"].astype(str).str.strip() == "")
+                    &
+                    (cleaned["precio"].fillna(0).astype(float) <= 0)
+                )
+            )
+        ]
+
+        return ensure_inventory_schema(cleaned)
 
     quantity_col = None
     for candidate in ["llegaron", "cantidad", "qty", "unidades"]:
@@ -1413,51 +1433,87 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
             quantity_col = candidate
             break
 
-    # Si no hay cantidad, intentamos igual con una pieza por línea.
     if not quantity_col:
         raw["cantidad"] = 1
         quantity_col = "cantidad"
 
-    # Columnas de tallas: talla, tallas, tallas2, tallas3...
     talla_cols = []
     for c in raw.columns:
         if c == "talla" or c.startswith("talla") or c.startswith("tallas"):
             talla_cols.append(c)
 
-    # Calcular cuántas piezas se van a crear.
     total_pieces = 0
     expanded_plan = []
 
     for _, row in raw.iterrows():
-        # Ignorar filas resumen tipo TOTAL
+
         producto = clean_text(row.get("producto", ""))
         codigo = clean_text(row.get("codigo", ""))
-        if producto.upper() == "TOTAL" or codigo.upper() == "TOTAL":
+        marca = clean_text(row.get("marca", ""))
+        precio = parse_price(row.get("precio", 0))
+
+        producto_upper = producto.upper().strip()
+        codigo_upper = codigo.upper().strip()
+
+        # =====================================================
+        # IGNORAR FILAS BASURA / TOTALES
+        # =====================================================
+
+        # TOTAL / SUBTOTAL
+        if any(word in producto_upper for word in ["TOTAL", "SUBTOTAL"]):
+            continue
+
+        if any(word in codigo_upper for word in ["TOTAL", "SUBTOTAL"]):
+            continue
+
+        # fila completamente vacía
+        meaningful = any([
+            producto,
+            codigo,
+            marca,
+            precio > 0,
+        ])
+
+        if not meaningful:
+            continue
+
+        # precio 0 y sin codigo -> casi seguro basura
+        if precio <= 0 and not codigo:
             continue
 
         q = row.get(quantity_col, 1)
+
         try:
             q = int(float(q))
         except Exception:
             q = 1
+
         q = max(q, 0)
 
+        if q == 0:
+            continue
+
         tallas = []
+
         for tc in talla_cols:
             val = clean_text(row.get(tc, ""))
-            if val and val.lower() not in ["nan", "none"]:
-                # Evita 40.0
-                try:
-                    if re.fullmatch(r"\d+\.0", val):
-                        val = str(int(float(val)))
-                except Exception:
-                    pass
-                tallas.append(f"T{val}" if val.isdigit() else val.upper())
 
-        # Si hay tallas, usamos las tallas como piezas. Si hay menos tallas que cantidad,
-        # completamos con talla única.
+            if not val or val.lower() in ["nan", "none"]:
+                continue
+
+            try:
+                if re.fullmatch(r"\d+\.0", val):
+                    val = str(int(float(val)))
+            except Exception:
+                pass
+
+            tallas.append(
+                f"T{val}" if val.isdigit() else val.upper()
+            )
+
         if tallas:
             piece_tallas = tallas[:q] if q else tallas
+
             while len(piece_tallas) < q:
                 piece_tallas.append("")
         else:
@@ -1468,10 +1524,13 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
             total_pieces += 1
 
     generated_numbers = next_inventory_numbers(existing_df, total_pieces)
+
     expanded_rows = []
 
     for idx, (row, talla) in enumerate(expanded_plan):
+
         numero = generated_numbers[idx]
+
         producto = clean_text(row.get("producto", ""))
         codigo = clean_text(row.get("codigo", ""))
         marca = clean_text(row.get("marca", ""))
@@ -1489,8 +1548,9 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
             "fecha_actualizacion": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-    return ensure_inventory_schema(pd.DataFrame(expanded_rows))
+    final_df = pd.DataFrame(expanded_rows)
 
+    return ensure_inventory_schema(final_df)
 
 def build_brand_map_from_excel(uploaded_file):
     """
@@ -1588,6 +1648,14 @@ def cargar_page(df):
 
             st.markdown("### Vista previa de mercancía nueva")
             st.dataframe(new, use_container_width=True)
+
+            sincodigo_count = int(new["codigo_interno"].astype(str).str.contains("SINCODIGO", na=False).sum())
+            if sincodigo_count > 0:
+                st.warning(
+                    f"Hay {sincodigo_count} piezas sin código/modelo. "
+                    "Revisa el Excel original porque podrían ser filas incompletas o resúmenes."
+                )
+
             st.caption("Si el Excel venía por modelo con cantidad, aquí ya aparece expandido a una línea por pieza, con números únicos asignados automáticamente.")
 
             combined, skipped, added_count, brand_updates = append_inventory(df, new)
