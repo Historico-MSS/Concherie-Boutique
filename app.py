@@ -817,9 +817,14 @@ El archivo debe tener estas hojas:
 # ============================================================
 def login():
     st.title("Concherie")
-    u = st.text_input("Usuario")
-    p = st.text_input("Clave", type="password")
-    if st.button("Entrar", use_container_width=True):
+
+    # Al estar dentro de un form, presionar Enter en la clave ejecuta "Entrar".
+    with st.form("login_form"):
+        u = st.text_input("Usuario")
+        p = st.text_input("Clave", type="password")
+        submitted = st.form_submit_button("Entrar", use_container_width=True)
+
+    if submitted:
         if u in USERS and USERS[u]["password"] == p:
             st.session_state.user = u
             st.session_state.role = USERS[u]["role"]
@@ -1036,26 +1041,116 @@ def inventory_page(df):
             st.error(msg)
 
 
+
+def append_inventory(existing_df: pd.DataFrame, new_df: pd.DataFrame):
+    existing_df = ensure_inventory_schema(existing_df)
+    new_df = ensure_inventory_schema(new_df)
+
+    if existing_df.empty:
+        combined = new_df.copy()
+        return ensure_inventory_schema(combined), [], len(new_df)
+
+    existing_codes = set(existing_df["codigo_interno"].astype(str).str.upper())
+    existing_nums = set(existing_df["numero"].astype(str).apply(normalize_numero))
+
+    rows_to_add = []
+    skipped = []
+
+    for _, row in new_df.iterrows():
+        codigo_interno = clean_text(row.get("codigo_interno")).upper()
+        numero = normalize_numero(row.get("numero"))
+
+        duplicated = False
+        reason = ""
+
+        if codigo_interno and codigo_interno in existing_codes:
+            duplicated = True
+            reason = f"código interno ya existe: {codigo_interno}"
+        elif numero and numero in existing_nums:
+            duplicated = True
+            reason = f"número ya existe: {numero}"
+
+        if duplicated:
+            skipped.append({
+                "numero": numero,
+                "codigo_interno": codigo_interno,
+                "motivo": reason,
+            })
+        else:
+            rows_to_add.append(row)
+            existing_codes.add(codigo_interno)
+            existing_nums.add(numero)
+
+    if rows_to_add:
+        add_df = pd.DataFrame(rows_to_add)
+        combined = pd.concat([existing_df, add_df], ignore_index=True)
+    else:
+        combined = existing_df.copy()
+
+    return ensure_inventory_schema(combined), skipped, len(rows_to_add)
+
+
 def cargar_page(df):
     st.title("Cargar inventario")
-    st.warning("Esto reemplaza el inventario actual. Usa solo si vas a recargar desde Excel.")
-    uploaded = st.file_uploader("Excel inventario", type=["xlsx", "xls"])
-    if uploaded:
-        new = pd.read_excel(uploaded)
-        new = ensure_inventory_schema(new)
-        st.dataframe(new, use_container_width=True)
-        confirm = st.text_input("Para reemplazar inventario escribe CARGAR")
-        if st.button("Guardar inventario", type="primary"):
-            if confirm == "CARGAR":
-                ok, msg = save_inventory(new)
+
+    modo = st.radio(
+        "¿Qué quieres hacer?",
+        ["Agregar mercancía nueva", "Reemplazar inventario completo"],
+        horizontal=True,
+    )
+
+    if modo == "Agregar mercancía nueva":
+        st.info(
+            "Esta opción agrega piezas nuevas al inventario actual. "
+            "Si una pieza ya existe por número o código interno, no la duplica."
+        )
+        uploaded = st.file_uploader("Excel con mercancía nueva", type=["xlsx", "xls"], key="append_inventory_file")
+
+        if uploaded:
+            new = pd.read_excel(uploaded)
+            new = ensure_inventory_schema(new)
+
+            st.markdown("### Vista previa de mercancía nueva")
+            st.dataframe(new, use_container_width=True)
+
+            combined, skipped, added_count = append_inventory(df, new)
+
+            c1, c2 = st.columns(2)
+            c1.metric("Piezas nuevas a agregar", added_count)
+            c2.metric("Duplicadas / omitidas", len(skipped))
+
+            if skipped:
+                st.warning("Estas piezas ya existen y no se agregarán nuevamente:")
+                st.dataframe(pd.DataFrame(skipped), use_container_width=True)
+
+            if st.button("Agregar al inventario", type="primary", use_container_width=True):
+                ok, msg = save_inventory(combined)
                 if ok:
-                    st.success("Inventario cargado.")
+                    st.success(f"Mercancía agregada correctamente. Se agregaron {added_count} piezas nuevas.")
                     st.rerun()
                 else:
                     st.error(msg)
-            else:
-                st.error("Confirmación incorrecta.")
 
+    else:
+        st.warning("Esto SÍ reemplaza el inventario actual. Usa solo si quieres borrar todo y recargar desde Excel.")
+        uploaded = st.file_uploader("Excel inventario completo", type=["xlsx", "xls"], key="replace_inventory_file")
+
+        if uploaded:
+            new = pd.read_excel(uploaded)
+            new = ensure_inventory_schema(new)
+            st.dataframe(new, use_container_width=True)
+
+            confirm = st.text_input("Para reemplazar inventario escribe REEMPLAZAR")
+            if st.button("Reemplazar inventario completo", type="primary", use_container_width=True):
+                if confirm == "REEMPLAZAR":
+                    ok, msg = save_inventory(new)
+                    if ok:
+                        st.success("Inventario reemplazado.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.error("Confirmación incorrecta.")
 
 def admin_page(df):
     st.title("Admin")
@@ -1106,3 +1201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
