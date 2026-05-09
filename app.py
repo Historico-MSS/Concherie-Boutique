@@ -220,6 +220,34 @@ def parse_price(v):
         return 0.0
 
 
+
+def is_summary_or_total_row(row) -> bool:
+    """Detecta filas de resumen que NO son piezas reales.
+
+    Importante: solo elimina TOTAL/SUBTOTAL cuando el campo completo es ese valor
+    o cuando viene como fila de resumen sin codigo/precio real. No elimina piezas
+    legitimas que contengan la palabra TOTAL dentro de una descripcion.
+    """
+    producto = clean_text(row.get("producto", "")).upper()
+    codigo = clean_text(row.get("codigo", "")).upper()
+    marca = clean_text(row.get("marca", "")).upper()
+    precio = parse_price(row.get("precio", 0))
+
+    stop_words = {"TOTAL", "SUBTOTAL", "TOTAL GENERAL", "GRAN TOTAL"}
+
+    if producto in stop_words or codigo in stop_words:
+        return True
+
+    # Casos tipicos: marca real + producto TOTAL + precio 0, o fila sin codigo real.
+    if producto in stop_words and (not codigo or precio <= 0):
+        return True
+
+    # Fila vacia o de resumen con precio 0 y sin datos utiles.
+    if not any([producto, codigo, marca]) and precio <= 0:
+        return True
+
+    return False
+
 def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=REQUIRED_COLUMNS)
@@ -278,6 +306,9 @@ def ensure_inventory_schema(df: pd.DataFrame) -> pd.DataFrame:
 
     df["codigo_interno"] = df.apply(make_internal, axis=1)
     df["fecha_actualizacion"] = df["fecha_actualizacion"].apply(clean_text)
+
+    # Eliminar filas de resumen, por ejemplo producto exacto TOTAL, antes de guardar/mostrar/exportar.
+    df = df[~df.apply(is_summary_or_total_row, axis=1)].copy()
 
     return df[REQUIRED_COLUMNS].sort_values("codigo_interno").reset_index(drop=True)
 
@@ -462,84 +493,157 @@ def build_labels_pdf(df: pd.DataFrame) -> bytes:
 
 
 def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="", group_by_brand=True) -> bytes:
-    df = ensure_inventory_schema(df)
+    """PDF listado, sin fotos, con texto completo y codigos internos visibles."""
+    df = inventory_export_df(df)
     if talla_filter.strip():
         tf = talla_filter.strip().upper()
         df = df[df["talla"].astype(str).str.upper().str.contains(tf, na=False)]
 
-    df["numero_sort"] = df["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else 999999)
-    df = df.sort_values(["numero_sort", "marca", "producto"]).drop(columns=["numero_sort"], errors="ignore")
-
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=A4)
-    w, h = A4
-    margin = 1.15 * cm
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    w, h = landscape(A4)
+    margin = 0.9 * cm
+    usable_w = w - 2 * margin
     y = h - margin
+
+    # Columnas en puntos. Suman el ancho util de A4 horizontal.
+    columns = [
+        ("#", "numero", 1.05 * cm),
+        ("Código interno", "codigo_interno", 4.75 * cm),
+        ("Marca", "marca", 3.35 * cm),
+        ("Código", "codigo", 2.65 * cm),
+        ("Producto", "producto", 5.55 * cm),
+        ("Color", "color", 2.65 * cm),
+        ("Talla", "talla", 2.45 * cm),
+    ]
+    if include_price:
+        columns.append(("Precio", "precio", 2.25 * cm))
+
+    # Si por redondeo sobra/falta, ajusta producto.
+    total_cols_w = sum(col[2] for col in columns)
+    diff = usable_w - total_cols_w
+    columns = [(label, key, width + (diff if key == "producto" else 0)) for label, key, width in columns]
+
+    font = "Helvetica"
+    font_bold = "Helvetica-Bold"
+    body_size = 6.7
+    header_size = 7.0
+    leading = 8.1
+
+    def wrap_text_pdf(text, max_width, font_name=font, font_size=body_size, max_lines=None):
+        text = clean_text(text)
+        if text == "":
+            return [""]
+        words = text.split()
+        lines = []
+        line = ""
+        for word in words:
+            # Si una palabra sola es larguisima, la partimos con guiones suaves simples.
+            if c.stringWidth(word, font_name, font_size) > max_width:
+                if line:
+                    lines.append(line)
+                    line = ""
+                chunk = ""
+                for ch in word:
+                    test = chunk + ch
+                    if c.stringWidth(test, font_name, font_size) <= max_width:
+                        chunk = test
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = ch
+                if chunk:
+                    line = chunk
+                continue
+            test = f"{line} {word}".strip()
+            if c.stringWidth(test, font_name, font_size) <= max_width:
+                line = test
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        if max_lines is not None:
+            return lines[:max_lines]
+        return lines or [""]
 
     def header():
         nonlocal y
         c.setFillColorRGB(0.10, 0.10, 0.14)
-        c.setFont("Helvetica-Bold", 18)
+        c.setFont(font_bold, 16)
         c.drawString(margin, y, "Inventario Concherie")
-        c.setFont("Helvetica", 8.5)
+        c.setFont(font, 8)
         c.drawRightString(w - margin, y, datetime.now().strftime("%d/%m/%Y %H:%M"))
-        y -= 0.55 * cm
+        y -= 0.46 * cm
         c.setStrokeColorRGB(0.78, 0.72, 0.62)
+        c.setLineWidth(0.7)
         c.line(margin, y, w - margin, y)
-        y -= 0.35 * cm
+        y -= 0.28 * cm
 
     def table_header():
         nonlocal y
+        header_h = 0.48 * cm
         c.setFillColorRGB(0.13, 0.13, 0.17)
-        c.roundRect(margin, y - 0.43 * cm, w - 2 * margin, 0.43 * cm, 4, fill=1, stroke=0)
+        c.roundRect(margin, y - header_h, usable_w, header_h, 4, fill=1, stroke=0)
         c.setFillColorRGB(1, 1, 1)
-        c.setFont("Helvetica-Bold", 6.8)
-        headers = [("#", 0), ("Marca", 1.15*cm), ("Código", 3.3*cm), ("Producto", 5.45*cm), ("Color", 9.85*cm), ("Talla", 12.2*cm)]
-        if include_price:
-            headers.append(("Precio", 14.4*cm))
-        for label, xoff in headers:
-            c.drawString(margin + xoff + 0.06*cm, y - 0.28*cm, label)
-        y -= 0.50 * cm
+        c.setFont(font_bold, header_size)
+        x = margin
+        for label, key, width in columns:
+            c.drawString(x + 0.06 * cm, y - 0.31 * cm, label)
+            x += width
+        y -= header_h + 0.08 * cm
 
-    def fit(text, width, font="Helvetica", size=6.7):
-        text = clean_text(text)
-        if c.stringWidth(text, font, size) <= width:
-            return text
-        while text and c.stringWidth(text + "...", font, size) > width:
-            text = text[:-1]
-        return text + "..." if text else ""
+    def draw_row(r):
+        nonlocal y
+        values = {
+            "numero": normalize_numero(r.get("numero", "")),
+            "codigo_interno": clean_text(r.get("codigo_interno", "")),
+            "marca": clean_text(r.get("marca", "")),
+            "codigo": clean_text(r.get("codigo", "")) or clean_text(r.get("codigo_interno", "")).split("-")[0],
+            "producto": clean_text(r.get("producto", "")),
+            "color": clean_text(r.get("color", "")),
+            "talla": display_talla(r.get("talla", "")),
+            "precio": money(r.get("precio", 0)),
+        }
+        wrapped = []
+        max_lines = 4
+        for label, key, width in columns:
+            # Evita filas demasiado altas, pero no corta con puntos suspensivos: envuelve en varias lineas.
+            lines = wrap_text_pdf(values[key], width - 0.12 * cm, max_lines=max_lines)
+            wrapped.append(lines)
+        line_count = max(len(lines) for lines in wrapped)
+        row_h = max(0.45 * cm, 0.18 * cm + line_count * leading)
 
-    header()
-    table_header()
-    c.setFont("Helvetica", 6.7)
-    row_h = 0.43 * cm
-    for _, r in df.iterrows():
-        if y < margin + 0.8 * cm:
+        if y - row_h < margin:
             c.showPage()
             y = h - margin
             header()
             table_header()
-            c.setFont("Helvetica", 6.7)
+
         c.setFillColorRGB(0.15, 0.15, 0.18)
-        vals = [
-            (normalize_numero(r["numero"]), 0, 1.0*cm),
-            (r["marca"], 1.15*cm, 2.0*cm),
-            (r["codigo"], 3.3*cm, 2.0*cm),
-            (r["producto"], 5.45*cm, 4.2*cm),
-            (r["color"], 9.85*cm, 2.1*cm),
-            (display_talla(r["talla"]), 12.2*cm, 2.0*cm),
-        ]
-        if include_price:
-            vals.append((money(r["precio"]), 14.4*cm, 2.0*cm))
-        for val, xoff, width in vals:
-            c.drawString(margin + xoff + 0.06*cm, y - 0.28*cm, fit(val, width))
+        c.setFont(font, body_size)
+        x = margin
+        for (label, key, width), lines in zip(columns, wrapped):
+            ty = y - 0.28 * cm
+            for line in lines:
+                c.drawString(x + 0.06 * cm, ty, line)
+                ty -= leading
+            x += width
         c.setStrokeColorRGB(0.88, 0.88, 0.88)
-        c.line(margin, y - row_h + 0.05*cm, w - margin, y - row_h + 0.05*cm)
+        c.setLineWidth(0.25)
+        c.line(margin, y - row_h + 0.04 * cm, w - margin, y - row_h + 0.04 * cm)
         y -= row_h
+
+    header()
+    table_header()
+    for _, r in df.iterrows():
+        draw_row(r)
 
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
+
 
 def inventory_export_df(df: pd.DataFrame) -> pd.DataFrame:
     out = ensure_inventory_schema(df).copy()
