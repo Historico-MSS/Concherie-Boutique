@@ -1980,7 +1980,7 @@ def cargar_page(df):
 
     modo = st.radio(
         "¿Qué quieres hacer?",
-        ["Agregar mercancía nueva", "Reemplazar inventario completo"],
+        ["Agregar mercancía nueva", "Corregir solo Maison 001-127", "Reemplazar inventario completo"],
         horizontal=True,
     )
 
@@ -2030,6 +2030,51 @@ def cargar_page(df):
                     else:
                         st.error(msg)
 
+    elif modo == "Corregir solo Maison 001-127":
+        st.warning(
+            "Usa esta opción SOLO para reconstruir las piezas 001 a 127 de Maison Rabih Kayrouz. "
+            "No toca las piezas 128 en adelante."
+        )
+        uploaded = st.file_uploader("Excel original de Maison Rabih Kayrouz", type=["xlsx", "xls"], key="mrk_001_127_file")
+
+        if uploaded:
+            raw_mrk = pd.read_excel(uploaded)
+            empty_base = pd.DataFrame(columns=REQUIRED_COLUMNS)
+            mrk_new = prepare_new_merchandise_upload(raw_mrk, empty_base)
+            mrk_new = order_by_numero(mrk_new)
+
+            # Mantener únicamente la sección 001-127 reconstruida desde el Excel original
+            mrk_new = filter_by_numero_range(mrk_new, min_num=1, max_num=127)
+
+            st.markdown("### Vista previa Maison Rabih Kayrouz 001-127 corregido")
+            st.dataframe(inventory_export_df(mrk_new), use_container_width=True, hide_index=True)
+
+            if len(mrk_new) != 127:
+                st.error(
+                    f"Atención: la reconstrucción generó {len(mrk_new)} piezas, no 127. "
+                    "No guardes hasta revisar el Excel original."
+                )
+            else:
+                st.success("Se detectaron 127 piezas para Maison Rabih Kayrouz.")
+
+            rest = df.copy()
+            rest["_num_int"] = rest["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else 999999)
+            rest = rest[rest["_num_int"] > 127].drop(columns=["_num_int"])
+            combined = pd.concat([mrk_new, rest], ignore_index=True)
+            combined = order_by_numero(ensure_inventory_schema(combined))
+
+            confirm = st.text_input("Para reemplazar solo Maison 001-127 escribe MRK")
+            if st.button("Reemplazar solo Maison 001-127", type="primary", use_container_width=True):
+                if confirm.strip().upper() == "MRK":
+                    ok, msg = save_inventory(combined)
+                    if ok:
+                        st.success("Maison Rabih Kayrouz 001-127 fue corregido. Las piezas 128 en adelante no se tocaron.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.error("Confirmación incorrecta.")
+
     else:
         st.warning("Esto SÍ reemplaza el inventario actual. Usa solo si quieres borrar todo y recargar desde Excel.")
         uploaded = st.file_uploader("Excel inventario completo", type=["xlsx", "xls"], key="replace_inventory_file")
@@ -2041,7 +2086,7 @@ def cargar_page(df):
 
             confirm = st.text_input("Para reemplazar inventario escribe REEMPLAZAR")
             if st.button("Reemplazar inventario completo", type="primary", use_container_width=True):
-                if confirm == "REEMPLAZAR":
+                if confirm.strip().upper() == "REEMPLAZAR":
                     valid, err = validate_locked_numbers(df, new)
                     if not valid:
                         st.error(err)
