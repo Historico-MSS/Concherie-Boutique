@@ -362,121 +362,105 @@ def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="", gro
         tf = talla_filter.strip().upper()
         df = df[df["talla"].astype(str).str.upper().str.contains(tf, na=False)]
 
-    if "marca" not in df.columns:
-        df["marca"] = ""
-
-    df["marca"] = df["marca"].apply(clean_text).replace("", "SIN MARCA")
-    df = df.sort_values(["marca", "producto", "color", "talla", "numero"])
+    df["numero_sort"] = df["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else 999999)
+    df = df.sort_values(["numero_sort", "marca", "producto"]).drop(columns=["numero_sort"], errors="ignore")
 
     buffer = io.BytesIO()
-    c = canvas.Canvas(buffer, pagesize=landscape(A4))
-    w, h = landscape(A4)
-    margin = 1.3 * cm
-    card_w = (w - 2 * margin - 0.7 * cm) / 2
-    card_h = 6.7 * cm
-    gap = 0.7 * cm
+    c = canvas.Canvas(buffer, pagesize=A4)
+    w, h = A4
+    margin = 1.15 * cm
+    y = h - margin
 
-    def header(subtitle="Catálogo disponible"):
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 20)
-        c.drawString(margin, h - margin, "CONCHERIE BOUTIQUE")
-        c.setFont("Helvetica", 10)
-        c.drawString(margin, h - margin - 0.45 * cm, subtitle)
+    def header():
+        nonlocal y
+        c.setFillColorRGB(0.10, 0.10, 0.14)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(margin, y, "Inventario Concherie")
+        c.setFont("Helvetica", 8.5)
+        c.drawRightString(w - margin, y, datetime.now().strftime("%d/%m/%Y %H:%M"))
+        y -= 0.55 * cm
+        c.setStrokeColorRGB(0.78, 0.72, 0.62)
+        c.line(margin, y, w - margin, y)
+        y -= 0.35 * cm
 
-    def brand_header(brand_name):
-        nonlocal y, col
-        if col != 0:
-            col = 0
-            y -= card_h + 0.55 * cm
-        if y < margin + card_h + 1.2 * cm:
-            c.showPage()
-            header()
-            y = h - margin - 1.3 * cm
-        c.setFillColorRGB(0.10, 0.10, 0.10)
-        c.roundRect(margin, y - 0.65 * cm, w - 2 * margin, 0.62 * cm, 6, fill=1, stroke=0)
+    def table_header():
+        nonlocal y
+        c.setFillColorRGB(0.13, 0.13, 0.17)
+        c.roundRect(margin, y - 0.43 * cm, w - 2 * margin, 0.43 * cm, 4, fill=1, stroke=0)
         c.setFillColorRGB(1, 1, 1)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(margin + 0.25 * cm, y - 0.43 * cm, clean_text(brand_name))
-        y -= 1.05 * cm
+        c.setFont("Helvetica-Bold", 6.8)
+        headers = [("#", 0), ("Marca", 1.15*cm), ("Código", 3.3*cm), ("Producto", 5.45*cm), ("Color", 9.85*cm), ("Talla", 12.2*cm)]
+        if include_price:
+            headers.append(("Precio", 14.4*cm))
+        for label, xoff in headers:
+            c.drawString(margin + xoff + 0.06*cm, y - 0.28*cm, label)
+        y -= 0.50 * cm
+
+    def fit(text, width, font="Helvetica", size=6.7):
+        text = clean_text(text)
+        if c.stringWidth(text, font, size) <= width:
+            return text
+        while text and c.stringWidth(text + "...", font, size) > width:
+            text = text[:-1]
+        return text + "..." if text else ""
 
     header()
-    y = h - margin - 1.3 * cm
-    col = 0
-    current_brand = None
-
-    for _, row in df.iterrows():
-        brand = clean_text(row.get("marca")) or "SIN MARCA"
-
-        if group_by_brand and brand != current_brand:
-            current_brand = brand
-            brand_header(brand)
-
-        if y - card_h < margin:
+    table_header()
+    c.setFont("Helvetica", 6.7)
+    row_h = 0.43 * cm
+    for _, r in df.iterrows():
+        if y < margin + 0.8 * cm:
             c.showPage()
+            y = h - margin
             header()
-            y = h - margin - 1.3 * cm
-            col = 0
-            if group_by_brand:
-                brand_header(brand)
-
-        x = margin + col * (card_w + gap)
-
-        c.setStrokeColorRGB(0.85, 0.85, 0.85)
-        c.setFillColorRGB(1, 1, 1)
-        c.roundRect(x, y - card_h, card_w, card_h, 8, stroke=1, fill=0)
-
-        # Brand pill inside card
-        c.setFillColorRGB(0.93, 0.90, 0.84)
-        c.roundRect(x + 0.25 * cm, y - 0.58 * cm, card_w - 0.5 * cm, 0.38 * cm, 5, fill=1, stroke=0)
-        c.setFillColorRGB(0.16, 0.16, 0.16)
-        c.setFont("Helvetica-Bold", 7.3)
-        c.drawString(x + 0.42 * cm, y - 0.45 * cm, brand[:32])
-
-        # photo area
-        photo_url = clean_text(row.get("foto_url"))
-        if photo_url.startswith("http"):
-            try:
-                img_data = requests.get(photo_url, timeout=10).content
-                img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                img.thumbnail((500, 500))
-                c.drawImage(
-                    pil_to_reader(img),
-                    x + 0.3 * cm,
-                    y - 4.0 * cm,
-                    width=2.9 * cm,
-                    height=2.9 * cm,
-                    preserveAspectRatio=True,
-                    anchor="c",
-                )
-            except Exception:
-                c.setFillColorRGB(0.95, 0.95, 0.95)
-                c.rect(x + 0.3 * cm, y - 4.0 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
-        else:
-            c.setFillColorRGB(0.96, 0.96, 0.96)
-            c.rect(x + 0.3 * cm, y - 4.0 * cm, 2.9 * cm, 2.9 * cm, fill=1, stroke=0)
-            c.setFillColorRGB(0.45, 0.45, 0.45)
-            c.setFont("Helvetica", 8)
-            c.drawCentredString(x + 1.75 * cm, y - 2.55 * cm, "Sin foto")
-
-        tx = x + 3.55 * cm
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 9.2)
-        c.drawString(tx, y - 1.03 * cm, f"{normalize_numero(row['numero'])} · {clean_text(row['producto'])[:24]}")
-        c.setFont("Helvetica-Oblique", 8)
-        c.drawString(tx, y - 1.52 * cm, f"{clean_text(row['color'])} · {display_talla(row['talla'])}")
-        c.setFont("Helvetica", 7)
-        c.drawString(tx, y - 2.02 * cm, clean_text(row["codigo_interno"])[:30])
-
+            table_header()
+            c.setFont("Helvetica", 6.7)
+        c.setFillColorRGB(0.15, 0.15, 0.18)
+        vals = [
+            (normalize_numero(r["numero"]), 0, 1.0*cm),
+            (r["marca"], 1.15*cm, 2.0*cm),
+            (r["codigo"], 3.3*cm, 2.0*cm),
+            (r["producto"], 5.45*cm, 4.2*cm),
+            (r["color"], 9.85*cm, 2.1*cm),
+            (display_talla(r["talla"]), 12.2*cm, 2.0*cm),
+        ]
         if include_price:
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(tx, y - 2.88 * cm, money(row["precio"]))
-
-        col += 1
-        if col == 2:
-            col = 0
-            y -= card_h + 0.55 * cm
+            vals.append((money(r["precio"]), 14.4*cm, 2.0*cm))
+        for val, xoff, width in vals:
+            c.drawString(margin + xoff + 0.06*cm, y - 0.28*cm, fit(val, width))
+        c.setStrokeColorRGB(0.88, 0.88, 0.88)
+        c.line(margin, y - row_h + 0.05*cm, w - margin, y - row_h + 0.05*cm)
+        y -= row_h
 
     c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+def inventory_export_df(df: pd.DataFrame) -> pd.DataFrame:
+    out = ensure_inventory_schema(df).copy()
+    out["numero_sort"] = out["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else 999999)
+    out = out.sort_values(["numero_sort", "marca", "producto"]).drop(columns=["numero_sort"], errors="ignore")
+    return out[["numero", "codigo_interno", "marca", "codigo", "producto", "color", "talla", "precio", "fecha_actualizacion"]]
+
+def build_inventory_excel(df: pd.DataFrame) -> bytes:
+    out = inventory_export_df(df)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        out.to_excel(writer, index=False, sheet_name="Inventario")
+        ws = writer.sheets["Inventario"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        widths = {"A": 10, "B": 34, "C": 18, "D": 18, "E": 34, "F": 18, "G": 16, "H": 12, "I": 22}
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+        for cell in ws[1]:
+            cell.font = cell.font.copy(bold=True)
+        for cell in ws["A"]:
+            if cell.row > 1:
+                cell.number_format = "@"
+        for cell in ws["H"]:
+            if cell.row > 1:
+                cell.number_format = '"$"#,##0.00'
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -1106,14 +1090,9 @@ def sidebar():
     st.sidebar.title("Concherie")
     st.sidebar.write(f"Usuario: **{st.session_state.get('user')}**")
     st.sidebar.success(f"Datos: {st.session_state.get('data_status', 'Google Sheets')}")
-    if supabase_configured():
-        st.sidebar.success("Fotos: Supabase")
-    else:
-        st.sidebar.warning("Fotos: Supabase no configurado")
-
     buttons = [("🏠 Inicio", "inicio"), ("🔎 Buscar código", "buscar"), ("◼ Escanear QR", "scan")]
     if can_ventas():
-        buttons += [("📸 Fotos", "fotos"), ("📄 Catálogo", "catalogo"), ("🧾 Notas de venta", "notas")]
+        buttons += [("📄 Catálogo", "catalogo"), ("🧾 Notas de venta", "notas")]
     if can_admin():
         buttons += [("📥 Cargar inventario", "cargar"), ("🏷️ Generar QR", "qr"), ("📦 Inventario", "inventario"), ("🧩 Reparar marcas", "reparar_marcas"), ("⚙️ Admin", "admin")]
 
@@ -1147,21 +1126,15 @@ def find_product(df, query):
 def show_product(row):
     numero = normalize_numero(row["numero"])
     st.subheader(f"{numero} · {clean_text(row['producto'])}")
-    col1, col2, col3 = st.columns([1.1, 1.4, 0.9])
+    col1, col2 = st.columns([1.6, 0.8])
     with col1:
-        url = clean_text(row.get("foto_url"))
-        if url.startswith("http"):
-            st.image(url, use_container_width=True)
-        else:
-            st.info("Sin foto")
-    with col2:
         st.write(f"**Código numérico:** {numero}")
         st.write(f"**Código interno:** {clean_text(row['codigo_interno'])}")
         st.write(f"**Marca:** {clean_text(row.get('marca', ''))}")
         st.write(f"**Modelo:** {clean_text(row['codigo'])}")
         st.write(f"**Color:** {clean_text(row['color'])}")
         st.write(f"**Talla:** {display_talla(row['talla'])}")
-    with col3:
+    with col2:
         st.metric("Precio", money(row["precio"]))
 
 
@@ -1170,13 +1143,12 @@ def show_product(row):
 # ============================================================
 def home_page(df):
     st.title("Concherie Boutique")
-    st.caption("Inventario, QR, fotos y catálogo.")
+    st.caption("Inventario, QR, catálogo e informes.")
     cols = st.columns(3 if can_admin() else 2)
     with cols[0]:
         if st.button("◼ Escanear QR", use_container_width=True): set_page("scan")
         if st.button("🔎 Buscar código", use_container_width=True): set_page("buscar")
     with cols[1]:
-        if can_ventas() and st.button("📸 Fotos", use_container_width=True): set_page("fotos")
         if can_ventas() and st.button("📄 Catálogo", use_container_width=True): set_page("catalogo")
         if can_ventas() and st.button("🧾 Notas de venta", use_container_width=True): set_page("notas")
     if can_admin():
@@ -1187,8 +1159,8 @@ def home_page(df):
     st.divider()
     c1, c2, c3 = st.columns(3)
     c1.metric("Total piezas", len(df))
-    c2.metric("Con foto", int(df["foto_url"].astype(str).str.startswith("http").sum()) if not df.empty else 0)
-    c3.metric("Sin foto", int((~df["foto_url"].astype(str).str.startswith("http")).sum()) if not df.empty else 0)
+    c2.metric("Marcas", df["marca"].nunique() if not df.empty else 0)
+    c3.metric("Modelos", df["codigo"].nunique() if not df.empty else 0)
 
 
 def search_page(df):
@@ -1269,7 +1241,7 @@ def photos_page(df):
 
 
 def catalog_page(df):
-    st.title("Catálogo disponible")
+    st.title("Inventario / listado")
     if "marca" in df.columns:
         sin_marca_count = int(df["marca"].astype(str).str.strip().isin(["", "SIN MARCA", "nan", "None"]).sum())
         if sin_marca_count > 0:
@@ -1282,9 +1254,12 @@ def catalog_page(df):
         preview["marca"] = ""
     if talla_filter.strip():
         preview = preview[preview["talla"].astype(str).str.upper().str.contains(talla_filter.strip().upper(), na=False)]
-    st.dataframe(preview[["numero", "marca", "producto", "color", "talla", "precio", "foto_url"]], use_container_width=True)
-    pdf = build_catalog_pdf(df, include_price=include_price, talla_filter=talla_filter, group_by_brand=group_by_brand)
-    st.download_button("Descargar catálogo PDF", pdf, file_name="catalogo_concherie_por_marca.pdf", mime="application/pdf", use_container_width=True)
+    export_preview = inventory_export_df(preview)
+    st.dataframe(export_preview, use_container_width=True, hide_index=True)
+    excel = build_inventory_excel(preview)
+    st.download_button("Descargar inventario Excel", excel, file_name="inventario_concherie.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    pdf = build_catalog_pdf(preview, include_price=include_price, talla_filter=talla_filter, group_by_brand=group_by_brand)
+    st.download_button("Descargar inventario PDF", pdf, file_name="inventario_concherie.pdf", mime="application/pdf", use_container_width=True)
 
 
 def qr_page(df):
@@ -1295,8 +1270,12 @@ def qr_page(df):
 
 
 def inventory_page(df):
-    st.title("Inventario")
-    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic")
+    st.title("Inventario completo")
+    ordered = inventory_export_df(df)
+    st.caption("Listado ordenado por código numérico único.")
+    st.download_button("Descargar inventario Excel", build_inventory_excel(df), file_name="inventario_concherie.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.download_button("Descargar inventario PDF", build_catalog_pdf(df), file_name="inventario_concherie.pdf", mime="application/pdf", use_container_width=True)
+    edited = st.data_editor(ordered, use_container_width=True, num_rows="dynamic", hide_index=True)
     if st.button("Guardar cambios", type="primary"):
         ok, msg = save_inventory(edited)
         if ok:
@@ -1723,27 +1702,7 @@ def cargar_page(df):
 
 def admin_page(df):
     st.title("Admin")
-    st.subheader("Limpiar fotos")
-    q = st.text_input("Código de pieza", placeholder="Ej: 066")
-    if q:
-        row = find_product(df, q)
-        if row is not None:
-            show_product(row)
-            confirm = st.text_input("Para borrar la foto, escribe el código numérico")
-            pwd = st.text_input("Clave admin", type="password")
-            if st.button("Borrar foto", type="primary"):
-                if confirm == normalize_numero(row["numero"]) and pwd == USERS["jc"]["password"]:
-                    df.loc[df["numero"].astype(str).apply(normalize_numero) == normalize_numero(row["numero"]), "foto_url"] = ""
-                    ok, msg = save_inventory(df)
-                    if ok:
-                        st.success("Foto borrada.")
-                        st.rerun()
-                    else:
-                        st.error(msg)
-                else:
-                    st.error("Confirmación o clave incorrecta.")
-        else:
-            st.error("No encontré esa pieza.")
+    st.info("La app quedó simplificada: inventario, búsqueda, QR, carga de mercancía, catálogo/listado y notas de venta. Ya no se usan fotos de piezas.")
 
 
 def reparar_marcas_page(df):
@@ -1802,7 +1761,6 @@ def main():
     if page == "inicio": home_page(df)
     elif page == "buscar": search_page(df)
     elif page == "scan": scan_page(df)
-    elif page == "fotos" and can_ventas(): photos_page(df)
     elif page == "catalogo" and can_ventas(): catalog_page(df)
     elif page == "notas" and can_ventas(): invoice_page(df)
     elif page == "qr" and can_admin(): qr_page(df)
