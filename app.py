@@ -406,8 +406,30 @@ def pil_to_reader(img):
     return ImageReader(b)
 
 
-def build_labels_pdf(df: pd.DataFrame) -> bytes:
-    df = ensure_inventory_schema(df).sort_values("codigo_interno")
+def sort_inventory_by_numero(df: pd.DataFrame) -> pd.DataFrame:
+    """Ordena por el codigo numerico unico, conservando 001, 002, 003..."""
+    df = ensure_inventory_schema(df).copy()
+    df["_numero_sort"] = df["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else 999999)
+    return df.sort_values("_numero_sort").drop(columns=["_numero_sort"]).reset_index(drop=True)
+
+
+def filter_by_numero_range(df: pd.DataFrame, min_num: int = None, max_num: int = None) -> pd.DataFrame:
+    df = ensure_inventory_schema(df).copy()
+    df["_numero_int"] = df["numero"].astype(str).apply(lambda x: int(normalize_numero(x)) if normalize_numero(x).isdigit() else None)
+    if min_num is not None:
+        df = df[df["_numero_int"] >= min_num]
+    if max_num is not None:
+        df = df[df["_numero_int"] <= max_num]
+    return df.drop(columns=["_numero_int"]).reset_index(drop=True)
+
+
+def build_labels_pdf(df: pd.DataFrame, title: str = "Etiquetas Concherie") -> bytes:
+    """
+    Etiquetas 5x8 cm. El QR escanea solo el numero unico, pero la etiqueta visible
+    incluye marca, modelo/codigo, producto, color, talla y codigo interno.
+    El orden de impresion respeta el orden numerico del inventario.
+    """
+    df = sort_inventory_by_numero(df)
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     page_w, page_h = A4
@@ -418,6 +440,40 @@ def build_labels_pdf(df: pd.DataFrame) -> bytes:
     top_margin = 0.8 * cm
     rows = 5
     cols = 2
+
+    def fit_text(text, max_width, font_name="Helvetica", font_size=7.0):
+        text = clean_text(text)
+        if c.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        ellipsis = "..."
+        while text and c.stringWidth(text + ellipsis, font_name, font_size) > max_width:
+            text = text[:-1]
+        return text + ellipsis if text else ""
+
+    def wrap_lines(text, max_width, font_name="Helvetica", font_size=7.0, max_lines=2):
+        text = clean_text(text)
+        if not text:
+            return []
+        words = text.split()
+        lines, line = [], ""
+        for word in words:
+            test = f"{line} {word}".strip()
+            if c.stringWidth(test, font_name, font_size) <= max_width:
+                line = test
+            else:
+                if line:
+                    lines.append(line)
+                line = word
+        if line:
+            lines.append(line)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            last = lines[-1]
+            ellipsis = "..."
+            while last and c.stringWidth(last + ellipsis, font_name, font_size) > max_width:
+                last = last[:-1]
+            lines[-1] = last + ellipsis if last else ""
+        return lines
 
     def draw_grid():
         c.setDash(2, 3)
@@ -437,6 +493,7 @@ def build_labels_pdf(df: pd.DataFrame) -> bytes:
         if idx > 0 and pos == 0:
             c.showPage()
             draw_grid()
+
         col = pos % cols
         rr = pos // cols
         x = margin_x + col * label_w
@@ -444,53 +501,51 @@ def build_labels_pdf(df: pd.DataFrame) -> bytes:
         y = y_top - label_h
 
         numero = normalize_numero(row["numero"])
-        producto = clean_text(row["producto"])
-        color = clean_text(row["color"])
-        talla = display_talla(row["talla"])
-        interno = clean_text(row["codigo_interno"])
+        marca = clean_text(row.get("marca", ""))
+        codigo = clean_text(row.get("codigo", ""))
+        producto = clean_text(row.get("producto", ""))
+        color = clean_text(row.get("color", ""))
+        talla = display_talla(row.get("talla", ""))
+        interno = clean_text(row.get("codigo_interno", ""))
 
         qr_img = make_qr_image(numero, box_size=8)
-        qr_size = 3.55 * cm
+        qr_size = 3.45 * cm
         qr_x = x + 0.28 * cm
-        qr_y = y + 0.65 * cm
+        qr_y = y + 0.72 * cm
         c.drawImage(pil_to_reader(qr_img), qr_x, qr_y, width=qr_size, height=qr_size, mask="auto")
 
-        tx = x + 4.15 * cm
+        tx = x + 4.05 * cm
+        max_text_w = label_w - 4.35 * cm
+
         c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 24)
-        c.drawString(tx, y_top - 0.85 * cm, numero)
+        c.setFont("Helvetica-Bold", 22)
+        c.drawString(tx, y_top - 0.72 * cm, numero)
 
-        c.setFont("Helvetica-Bold", 7.2)
-        text_obj = c.beginText(tx, y_top - 1.35 * cm)
-        text_obj.setLeading(8)
-        # wrap product in max 2 lines
-        prod_words = producto.split()
-        lines = []
-        line = ""
-        for w in prod_words:
-            test = f"{line} {w}".strip()
-            if len(test) > 20 and line:
-                lines.append(line)
-                line = w
-            else:
-                line = test
-        if line:
-            lines.append(line)
-        for l in lines[:2]:
-            text_obj.textLine(l)
-        c.drawText(text_obj)
+        c.setFont("Helvetica-Bold", 6.6)
+        c.drawString(tx, y_top - 1.03 * cm, fit_text(marca, max_text_w, "Helvetica-Bold", 6.6))
 
-        c.setFont("Helvetica", 7.5)
-        c.drawString(tx, y_top - 2.25 * cm, color[:22])
-        c.drawString(tx, y_top - 2.65 * cm, talla[:22])
-        c.setFont("Helvetica", 5.2)
-        c.drawRightString(x + label_w - 0.25 * cm, y + 0.25 * cm, interno[:38])
+        c.setFont("Helvetica", 6.6)
+        modelo_line = f"Modelo: {codigo}" if codigo else "Modelo: S/C"
+        c.drawString(tx, y_top - 1.34 * cm, fit_text(modelo_line, max_text_w, "Helvetica", 6.6))
+
+        c.setFont("Helvetica-Bold", 7.0)
+        text_y = y_top - 1.72 * cm
+        for line in wrap_lines(producto, max_text_w, "Helvetica-Bold", 7.0, max_lines=2):
+            c.drawString(tx, text_y, line)
+            text_y -= 0.28 * cm
+
+        c.setFont("Helvetica", 6.5)
+        if color:
+            c.drawString(tx, y_top - 2.52 * cm, fit_text(f"Color: {color}", max_text_w, "Helvetica", 6.5))
+        c.drawString(tx, y_top - 2.82 * cm, fit_text(f"Talla: {talla}", max_text_w, "Helvetica", 6.5))
+
+        c.setFont("Helvetica", 5.0)
+        c.drawRightString(x + label_w - 0.25 * cm, y + 0.25 * cm, fit_text(interno, label_w - 0.55 * cm, "Helvetica", 5.0))
         idx += 1
 
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
-
 
 def build_catalog_pdf(df: pd.DataFrame, include_price=True, talla_filter="", group_by_brand=True) -> bytes:
     """PDF listado, sin fotos, con texto completo y codigos internos visibles."""
@@ -1473,10 +1528,49 @@ def catalog_page(df):
 
 def qr_page(df):
     st.title("Generar QR / etiquetas")
-    st.caption("Formato 5x8 cm, QR grande, código numérico grande y líneas punteadas comunes para guillotina.")
-    pdf = build_labels_pdf(df)
-    st.download_button("Descargar etiquetas PDF", pdf, file_name="etiquetas_concherie_5x8.pdf", mime="application/pdf", use_container_width=True)
+    st.caption("Formato 5x8 cm. El QR escanea el número único; la etiqueta visible incluye marca, modelo, producto, color, talla y código interno.")
 
+    df_ordered = sort_inventory_by_numero(df)
+    section_001_127 = filter_by_numero_range(df_ordered, max_num=127)
+    section_128_plus = filter_by_numero_range(df_ordered, min_num=128)
+
+    c1, c2 = st.columns(2)
+    c1.metric("Maison Rabih Kayrouz / ya impresas", len(section_001_127))
+    c2.metric("Pendientes para imprimir", len(section_128_plus))
+
+    st.markdown("### Sección 001-127 — Maison Rabih Kayrouz")
+    st.caption("Esta sección queda separada porque ya fue impresa. Sirve para reimprimir solo si hiciera falta.")
+    st.dataframe(inventory_export_df(section_001_127), use_container_width=True, hide_index=True)
+    pdf_001_127 = build_labels_pdf(section_001_127, title="Etiquetas 001-127")
+    st.download_button(
+        "Descargar etiquetas 001-127 PDF",
+        pdf_001_127,
+        file_name="etiquetas_concherie_001_127.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    st.markdown("### Sección 128 en adelante — pendientes de imprimir")
+    st.caption("Esta sección sale en el mismo orden numérico en que aparece en el inventario.")
+    st.dataframe(inventory_export_df(section_128_plus), use_container_width=True, hide_index=True)
+    pdf_128_plus = build_labels_pdf(section_128_plus, title="Etiquetas 128 en adelante")
+    st.download_button(
+        "Descargar etiquetas 128 en adelante PDF",
+        pdf_128_plus,
+        file_name="etiquetas_concherie_128_en_adelante.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    with st.expander("Descargar todo junto", expanded=False):
+        pdf_all = build_labels_pdf(df_ordered, title="Etiquetas completas")
+        st.download_button(
+            "Descargar todas las etiquetas PDF",
+            pdf_all,
+            file_name="etiquetas_concherie_todas.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
 
 def inventory_page(df):
     st.title("Inventario completo")
@@ -1669,20 +1763,36 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
 
         return ensure_inventory_schema(cleaned)
 
+    # Cantidad real: usar "llegó/llegaron" si existe y tiene valores por fila.
+    # Si no, usar cantidad/pedido/qty/unidades. Importante: no contar la fila TOTAL.
     quantity_col = None
-    for candidate in ["llegaron", "cantidad", "qty", "unidades"]:
+    preferred_quantity_cols = ["llegaron", "cantidad", "qty", "unidades"]
+    for candidate in preferred_quantity_cols:
         if candidate in raw.columns:
-            quantity_col = candidate
-            break
+            vals = pd.to_numeric(raw[candidate], errors="coerce")
+            # Si la columna solo tiene el total al final, no debe contarse como piezas.
+            non_summary_mask = ~(raw.get("producto", "").astype(str).apply(is_summary_label) | raw.get("codigo", "").astype(str).apply(is_summary_label))
+            if vals[non_summary_mask].fillna(0).sum() > 0:
+                quantity_col = candidate
+                break
 
     if not quantity_col:
         raw["cantidad"] = 1
         quantity_col = "cantidad"
 
+    def talla_sort_key(col):
+        # Ordena talla, tallas, tallas2, tallas3... de forma natural.
+        c = str(col).lower()
+        if c in ["talla", "tallas"]:
+            return 1
+        m = re.search(r"(\d+)$", c)
+        return int(m.group(1)) if m else 99
+
     talla_cols = []
     for c in raw.columns:
         if c == "talla" or c.startswith("talla") or c.startswith("tallas"):
             talla_cols.append(c)
+    talla_cols = sorted(talla_cols, key=talla_sort_key)
 
     total_pieces = 0
     expanded_plan = []
