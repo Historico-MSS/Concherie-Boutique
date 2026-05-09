@@ -44,6 +44,12 @@ REQUIRED_COLUMNS = [
     "fecha_actualizacion",
 ]
 
+# Números ya impresos/comprometidos.
+# Maison Rabih Kayrouz ya tiene QR del 001 al 127, por lo que la app
+# no debe renumerar ni modificar esos códigos numéricos.
+LOCKED_NUM_MIN = 1
+LOCKED_NUM_MAX = 127
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -52,6 +58,14 @@ def clean_text(x):
         return ""
     return str(x).strip()
 
+
+
+
+def is_summary_label(value):
+    """Detecta filas de resumen, sin bloquear productos que contengan la palabra TOTAL como parte del nombre."""
+    label = clean_text(value).upper()
+    label = re.sub(r"\s+", " ", label).strip()
+    return label in {"TOTAL", "TOTALES", "SUBTOTAL", "SUBTOTALES", "TOTAL GENERAL", "GRAND TOTAL"}
 
 def normalize_col_name(x):
     text = clean_text(x).lower().replace(" ", "_")
@@ -87,6 +101,97 @@ def normalize_numero(value):
     if m:
         return m.group(1).zfill(3)
     return s
+
+
+def numero_to_int(value):
+    n = normalize_numero(value)
+    return int(n) if n.isdigit() else None
+
+
+def is_locked_numero(value):
+    n = numero_to_int(value)
+    return n is not None and LOCKED_NUM_MIN <= n <= LOCKED_NUM_MAX
+
+
+def validate_locked_numbers(previous_df: pd.DataFrame, proposed_df: pd.DataFrame):
+    """
+    Protege las piezas 001-127: si ya existían, deben conservar el mismo número.
+    Valida por codigo_interno para permitir ordenar/exportar sin riesgo.
+    """
+    previous_df = ensure_inventory_schema(previous_df)
+    proposed_df = ensure_inventory_schema(proposed_df)
+
+    if previous_df.empty:
+        return True, ""
+
+    prev_locked = previous_df[previous_df["numero"].apply(is_locked_numero)].copy()
+    if prev_locked.empty:
+        return True, ""
+
+    proposed_by_internal = {
+        clean_text(r["codigo_interno"]).upper(): normalize_numero(r["numero"])
+        for _, r in proposed_df.iterrows()
+    }
+
+    issues = []
+    for _, r in prev_locked.iterrows():
+        internal = clean_text(r["codigo_interno"]).upper()
+        old_num = normalize_numero(r["numero"])
+        new_num = proposed_by_internal.get(internal)
+        if new_num != old_num:
+            issues.append(f"{old_num} · {internal}")
+
+    if issues:
+        preview = "; ".join(issues[:8])
+        more = "..." if len(issues) > 8 else ""
+        return False, (
+            f"No guardé los cambios porque intentan modificar o eliminar piezas ya protegidas "
+            f"del 001 al 127: {preview}{more}."
+        )
+
+    return True, ""
+
+
+def renumber_unlocked_from_128(df: pd.DataFrame):
+    """
+    Conserva 001-127 intactos y reasigna números consecutivos desde 128
+    a todas las demás piezas, siguiendo el orden visual actual del inventario.
+    """
+    df = ensure_inventory_schema(df).copy()
+    df["_old_numero"] = df["numero"].apply(normalize_numero)
+    df["_locked"] = df["numero"].apply(is_locked_numero)
+    df["_sort"] = df["numero"].apply(lambda x: numero_to_int(x) or 999999)
+
+    locked = df[df["_locked"]].copy()
+    unlocked = df[~df["_locked"]].copy().sort_values(["_sort", "marca", "producto", "codigo_interno"])
+
+    next_num = LOCKED_NUM_MAX + 1
+    changes = []
+    for idx in unlocked.index:
+        new_num = str(next_num).zfill(3)
+        old_num = df.at[idx, "_old_numero"]
+        df.at[idx, "numero"] = new_num
+
+        # Actualiza el sufijo del código interno para que coincida con el número visible.
+        internal = clean_text(df.at[idx, "codigo_interno"]).upper()
+        if internal:
+            parts = internal.split("-")
+            if parts:
+                parts[-1] = new_num
+                df.at[idx, "codigo_interno"] = "-".join(parts)
+
+        if old_num != new_num:
+            changes.append({
+                "numero_anterior": old_num,
+                "numero_nuevo": new_num,
+                "marca": clean_text(df.at[idx, "marca"]),
+                "producto": clean_text(df.at[idx, "producto"]),
+                "codigo_interno": clean_text(df.at[idx, "codigo_interno"]),
+            })
+        next_num += 1
+
+    df = df.drop(columns=["_old_numero", "_locked", "_sort"], errors="ignore")
+    return ensure_inventory_schema(df), pd.DataFrame(changes)
 
 
 def display_talla(talla):
@@ -1176,7 +1281,7 @@ def search_page(df):
 
 def scan_page(df):
     st.title("Escanear QR")
-    st.info("En iPhone, usa la cámara normal para leer el QR. Si prefieres, toma/sube una foto del QR aquí o escribe el código manualmente.")
+    st.info("En iPhone, usa la cámara normal para leer el QR. Si prefieres, también puedes escribir el código manualmente.")
     manual = st.text_input("Código manual", placeholder="Ej: 066")
     if manual:
         row = find_product(df, manual)
@@ -1272,16 +1377,46 @@ def qr_page(df):
 def inventory_page(df):
     st.title("Inventario completo")
     ordered = inventory_export_df(df)
-    st.caption("Listado ordenado por código numérico único.")
-    st.download_button("Descargar inventario Excel", build_inventory_excel(df), file_name="inventario_concherie.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    st.download_button("Descargar inventario PDF", build_catalog_pdf(df), file_name="inventario_concherie.pdf", mime="application/pdf", use_container_width=True)
+    st.caption("Listado ordenado por código numérico único. Los códigos 001 al 127 están protegidos porque ya fueron impresos para Maison Rabih Kayrouz.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button("Descargar inventario Excel", build_inventory_excel(df), file_name="inventario_concherie.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    with c2:
+        st.download_button("Descargar inventario PDF", build_catalog_pdf(df), file_name="inventario_concherie.pdf", mime="application/pdf", use_container_width=True)
+
+    with st.expander("Renumerar desde 128", expanded=False):
+        st.warning("Esta acción conserva intactos los números 001 al 127 y reasigna códigos consecutivos solo desde 128 en adelante.")
+        confirm = st.text_input("Para renumerar desde 128, escribe RENumerar".replace("RENumerar", "RENUMERAR"))
+        if st.button("Aplicar renumeración desde 128", use_container_width=True):
+            if confirm.strip().upper() != "RENUMERAR":
+                st.error("Confirmación incorrecta. No se hizo ningún cambio.")
+            else:
+                renumbered, changes = renumber_unlocked_from_128(df)
+                valid, err = validate_locked_numbers(df, renumbered)
+                if not valid:
+                    st.error(err)
+                else:
+                    ok, msg = save_inventory(renumbered)
+                    if ok:
+                        st.success(f"Inventario renumerado correctamente desde 128. Cambios aplicados: {len(changes)}.")
+                        if not changes.empty:
+                            st.dataframe(changes, use_container_width=True, hide_index=True)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
     edited = st.data_editor(ordered, use_container_width=True, num_rows="dynamic", hide_index=True)
     if st.button("Guardar cambios", type="primary"):
-        ok, msg = save_inventory(edited)
-        if ok:
-            st.success("Inventario guardado.")
+        valid, err = validate_locked_numbers(df, edited)
+        if not valid:
+            st.error(err)
         else:
-            st.error(msg)
+            ok, msg = save_inventory(edited)
+            if ok:
+                st.success("Inventario guardado.")
+            else:
+                st.error(msg)
 
 
 
@@ -1357,7 +1492,8 @@ def next_inventory_numbers(existing_df: pd.DataFrame, count: int):
         if clean_text(n).isdigit():
             max_num = max(max_num, int(n))
     nums = []
-    candidate = max_num + 1
+    # Nunca generar números dentro del bloque ya impreso 001-127.
+    candidate = max(max_num + 1, LOCKED_NUM_MAX + 1)
     while len(nums) < count:
         n = str(candidate).zfill(3)
         if n not in used:
@@ -1417,7 +1553,7 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
         # eliminar basura/totales
         cleaned = cleaned[
             ~(
-                cleaned["producto"].astype(str).str.upper().str.contains("TOTAL|SUBTOTAL", na=False)
+                cleaned["producto"].apply(is_summary_label)
                 |
                 (
                     (cleaned["codigo"].astype(str).str.strip() == "")
@@ -1462,10 +1598,7 @@ def prepare_new_merchandise_upload(raw_df: pd.DataFrame, existing_df: pd.DataFra
         # =====================================================
 
         # TOTAL / SUBTOTAL
-        if any(word in producto_upper for word in ["TOTAL", "SUBTOTAL"]):
-            continue
-
-        if any(word in codigo_upper for word in ["TOTAL", "SUBTOTAL"]):
+        if is_summary_label(producto) or is_summary_label(codigo):
             continue
 
         # fila completamente vacía
@@ -1672,12 +1805,16 @@ def cargar_page(df):
                 st.dataframe(pd.DataFrame(skipped), use_container_width=True)
 
             if st.button("Agregar al inventario", type="primary", use_container_width=True):
-                ok, msg = save_inventory(combined)
-                if ok:
-                    st.success(f"Mercancía procesada correctamente. Se agregaron {added_count} piezas nuevas y se repararon {brand_updates} marcas.")
-                    st.rerun()
+                valid, err = validate_locked_numbers(df, combined)
+                if not valid:
+                    st.error(err)
                 else:
-                    st.error(msg)
+                    ok, msg = save_inventory(combined)
+                    if ok:
+                        st.success(f"Mercancía procesada correctamente. Se agregaron {added_count} piezas nuevas y se repararon {brand_updates} marcas.")
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
     else:
         st.warning("Esto SÍ reemplaza el inventario actual. Usa solo si quieres borrar todo y recargar desde Excel.")
@@ -1691,12 +1828,16 @@ def cargar_page(df):
             confirm = st.text_input("Para reemplazar inventario escribe REEMPLAZAR")
             if st.button("Reemplazar inventario completo", type="primary", use_container_width=True):
                 if confirm == "REEMPLAZAR":
-                    ok, msg = save_inventory(new)
-                    if ok:
-                        st.success("Inventario reemplazado.")
-                        st.rerun()
+                    valid, err = validate_locked_numbers(df, new)
+                    if not valid:
+                        st.error(err)
                     else:
-                        st.error(msg)
+                        ok, msg = save_inventory(new)
+                        if ok:
+                            st.success("Inventario reemplazado.")
+                            st.rerun()
+                        else:
+                            st.error(msg)
                 else:
                     st.error("Confirmación incorrecta.")
 
@@ -1766,6 +1907,7 @@ def main():
     elif page == "qr" and can_admin(): qr_page(df)
     elif page == "inventario" and can_admin(): inventory_page(df)
     elif page == "cargar" and can_admin(): cargar_page(df)
+    elif page == "reparar_marcas" and can_admin(): reparar_marcas_page(df)
     elif page == "admin" and can_admin(): admin_page(df)
     else:
         st.warning("No tienes permiso para esta sección.")
